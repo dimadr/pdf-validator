@@ -1,9 +1,0 @@
-.env
-opencode.json
-opencode.jsonc
-SKILLS.md
-uploads/
-backup/
-__pycache__/
-*.pyc
-*.tar.gz
