@@ -79,6 +79,7 @@ class Attachment(Base):
     file_path = Column(String(500))
     file_sha256 = Column(String(64), nullable=False, unique=True)
     file_size = Column(Integer)
+    calculator_number = Column(String(50), index=True)
     status = Column(String(50), default="new")  # new, processing, validated, sent, rejected
     reject_reason = Column(String(100))  # subject_parse, dates, tables, no_recipient, send_error, other
     validation_result = Column(JSONB)
