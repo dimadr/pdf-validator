@@ -1,7 +1,6 @@
 .env
 opencode.json
 opencode.jsonc
-SKILLS.md
 uploads/
 __pycache__/
 *.pyc
