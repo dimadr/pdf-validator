@@ -1,4 +1,6 @@
 .env
+opencode.json
+opencode.jsonc
 uploads/
 __pycache__/
 *.pyc
