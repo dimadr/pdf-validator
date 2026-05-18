@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
+from sqlalchemy import or_
 from typing import List, Optional
 from datetime import datetime
 from uuid import UUID
@@ -10,6 +11,8 @@ import io
 
 from database import get_db
 from models import Attachment as AttachmentModel, Object as ObjectModel, IncomingMessage as MessageModel
+from utils import decode_email_header
+from sqlalchemy import func
 
 router = APIRouter()
 
@@ -40,8 +43,13 @@ async def get_rejection_report(
     db: Session = Depends(get_db)
 ):
     """Получить отчет об отклоненных вложениях (JSON)"""
+    # Include hard rejections by status and soft rejections where status later changes,
+    # but reject_reason remains filled.
     query = db.query(AttachmentModel).outerjoin(ObjectModel).outerjoin(MessageModel).filter(
-        AttachmentModel.status == 'rejected'
+        or_(
+            AttachmentModel.status == 'rejected',
+            AttachmentModel.reject_reason.isnot(None)
+        )
     )
     
     if date_from:
@@ -63,7 +71,7 @@ async def get_rejection_report(
             created_at=attachment.created_at,
             object_name=attachment.object.name if attachment.object else None,
             message_subject=attachment.message.subject if attachment.message else None,
-            from_email=attachment.message.from_email if attachment.message else None
+            from_email=decode_email_header(attachment.message.from_email) if attachment.message else None
         ))
     
     return reports
@@ -77,7 +85,10 @@ async def get_rejection_report_csv(
 ):
     """Экспорт отчета об отклоненных вложениях в CSV"""
     query = db.query(AttachmentModel).outerjoin(ObjectModel).outerjoin(MessageModel).filter(
-        AttachmentModel.status == 'rejected'
+        or_(
+            AttachmentModel.status == 'rejected',
+            AttachmentModel.reject_reason.isnot(None)
+        )
     )
     
     if date_from:
@@ -107,7 +118,7 @@ async def get_rejection_report_csv(
             attachment.created_at.isoformat(),
             attachment.object.name if attachment.object else '',
             attachment.message.subject if attachment.message else '',
-            attachment.message.from_email if attachment.message else '',
+            decode_email_header(attachment.message.from_email) if attachment.message else '',
             str(attachment.validation_result) if attachment.validation_result else ''
         ])
     
@@ -133,15 +144,28 @@ async def get_report_summary(
     if date_to:
         query = query.filter(AttachmentModel.created_at <= date_to)
     
-    # Get counts by status
-    total_attachments = query.count()
-    processed = query.filter(AttachmentModel.status.in_(['validated', 'sent', 'rejected'])).count()
-    rejected = query.filter(AttachmentModel.status == 'rejected').count()
-    sent = query.filter(AttachmentModel.status == 'sent').count()
+    # Get counts by status in single query
+    stats = db.query(
+        func.count().label('total'),
+        func.count().filter(AttachmentModel.status.in_(['validated', 'sent', 'rejected'])).label('processed'),
+        func.count().filter(AttachmentModel.reject_reason.isnot(None)).label('rejected'),
+        func.count().filter(AttachmentModel.status == 'sent').label('sent')
+    ).select_from(AttachmentModel)
+    
+    if date_from:
+        stats = stats.filter(AttachmentModel.created_at >= date_from)
+    if date_to:
+        stats = stats.filter(AttachmentModel.created_at <= date_to)
+    
+    result = stats.first()
+    total_attachments = result.total
+    processed = result.processed
+    rejected = result.rejected
+    sent = result.sent
     
     # Get rejection breakdown by reason
     rejected_by_reason = {}
-    rejections = query.filter(AttachmentModel.status == 'rejected').all()
+    rejections = query.filter(AttachmentModel.reject_reason.isnot(None)).all()
     for rejection in rejections:
         reason = rejection.reject_reason or 'unknown'
         rejected_by_reason[reason] = rejected_by_reason.get(reason, 0) + 1
@@ -161,36 +185,29 @@ async def get_processing_stats(
     db: Session = Depends(get_db)
 ):
     """Получить статистику обработки по дням"""
-    query = db.query(AttachmentModel)
+    from sqlalchemy import cast, Date
+    
+    daily_query = db.query(
+        cast(AttachmentModel.created_at, Date).label('date'),
+        func.count().label('total'),
+        func.count().filter(AttachmentModel.status == 'rejected').label('rejected'),
+        func.count().filter(AttachmentModel.status == 'sent').label('sent'),
+        func.count().filter(AttachmentModel.status.in_(['validated', 'sent', 'rejected'])).label('processed')
+    ).group_by(cast(AttachmentModel.created_at, Date))
     
     if date_from:
-        query = query.filter(AttachmentModel.created_at >= date_from)
+        daily_query = daily_query.filter(AttachmentModel.created_at >= date_from)
     if date_to:
-        query = query.filter(AttachmentModel.created_at <= date_to)
+        daily_query = daily_query.filter(AttachmentModel.created_at <= date_to)
     
-    attachments = query.all()
-    
-    # Group by date
     daily_stats = {}
-    for attachment in attachments:
-        date_key = attachment.created_at.date().isoformat()
-        if date_key not in daily_stats:
-            daily_stats[date_key] = {
-                'total': 0,
-                'processed': 0,
-                'rejected': 0,
-                'sent': 0
-            }
-        
-        daily_stats[date_key]['total'] += 1
-        
-        if attachment.status == 'rejected':
-            daily_stats[date_key]['rejected'] += 1
-        elif attachment.status == 'sent':
-            daily_stats[date_key]['sent'] += 1
-        
-        if attachment.status in ['validated', 'sent', 'rejected']:
-            daily_stats[date_key]['processed'] += 1
+    for row in daily_query:
+        daily_stats[row.date.isoformat()] = {
+            'total': row.total,
+            'processed': row.processed,
+            'rejected': row.rejected,
+            'sent': row.sent
+        }
     
     return {
         'daily_stats': daily_stats,

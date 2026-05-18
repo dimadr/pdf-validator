@@ -1,7 +1,7 @@
 import logging
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 
 def setup_logging(level: str = "INFO", format_type: str = "json"):
     """Setup logging configuration"""
@@ -14,7 +14,7 @@ def setup_logging(level: str = "INFO", format_type: str = "json"):
         class JSONFormatter(logging.Formatter):
             def format(self, record):
                 log_obj = {
-                    "timestamp": datetime.utcnow().isoformat(),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
                     "level": record.levelname,
                     "message": record.getMessage(),
                     "module": record.module,

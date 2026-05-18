@@ -2,8 +2,9 @@ import imaplib
 import email
 import os
 import hashlib
+import re
 from email.header import decode_header
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Optional
 
 from celery_app import celery_app, IMAP_SERVER, IMAP_PORT, IMAP_USER, IMAP_PASSWORD, UPLOAD_DIR
@@ -81,7 +82,7 @@ class IMAPClient:
             
             message_id = self._get_header(email_message, 'Message-ID')
             subject = self._decode_header(self._get_header(email_message, 'Subject'))
-            from_email = self._get_header(email_message, 'From')
+            from_email = self._decode_header(self._get_header(email_message, 'From'))
             date_str = self._get_header(email_message, 'Date')
             
             received_at = None
@@ -89,7 +90,39 @@ class IMAPClient:
                 try:
                     received_at = email.utils.parsedate_to_datetime(date_str)
                 except:
-                    received_at = datetime.utcnow()
+                    received_at = datetime.now(timezone.utc)
+            
+            # Check if this is a read receipt (MDN)
+            content_type = email_message.get_content_type()
+            is_mdn = False
+            original_message_id = None
+            
+            # Handle multipart/report (MDN/disposition-notification)
+            if content_type == 'multipart/report':
+                original_message_id = self._get_header(email_message, 'Original-Message-ID')
+                if original_message_id:
+                    is_mdn = True
+                    logger.info(f"Found MDN for message: {original_message_id}")
+                else:
+                    # Try to find in body
+                    for part in email_message.walk():
+                        if part.get_content_type() == 'message/disposition-notification':
+                            original_message_id = part.get('Original-Message-ID')
+                            if original_message_id:
+                                is_mdn = True
+                                logger.info(f"Found MDN in body for message: {original_message_id}")
+                                break
+            
+            # Also check for read receipts by subject (Timeweb sends simple emails)
+            # Use already decoded subject from line 84
+            if not is_mdn and ('Прочтено' in subject or 'Read:' in subject or 'прочитано' in subject.lower()):
+                # Try In-Reply-To or References headers
+                original_message_id = self._get_header(email_message, 'In-Reply-To')
+                if not original_message_id:
+                    original_message_id = self._get_header(email_message, 'References')
+                if original_message_id:
+                    is_mdn = True
+                    logger.info(f"Found read receipt via subject, original message: {original_message_id}")
             
             # Extract PDF attachments
             logger.info(f"Processing email: subject='{subject}', parts count: {len(list(email_message.walk()))}")
@@ -102,7 +135,9 @@ class IMAPClient:
                 'subject': subject,
                 'received_at': received_at,
                 'raw_content': raw_email,
-                'attachments': attachments
+                'attachments': attachments,
+                'is_mdn': is_mdn,
+                'original_message_id': original_message_id
             }
             
         except Exception as e:
@@ -165,21 +200,46 @@ def is_allowed_sender(from_email: str) -> bool:
             from_email = from_email.split('<')[1].split('>')[0]
         
         from_email = from_email.strip()
-        return from_email == 'noreply@eldis24.ru'
+        return from_email == 'noreply@example.com'
     
     except Exception as e:
         logger.error(f"Error checking sender: {e}")
         return False
 
 def parse_subject(subject: str) -> tuple:
-    """Парсить тему письма: 'Распечатка: Объект, Адрес'"""
+    """Парсить тему письма: 'DD-MM Объект Адрес (DD.MM.YYYY)' или 'Объект ул Адрес'"""
     if not subject:
         return None, None
     
     object_name = None
     address = None
     
-    if 'Распечатка:' in subject:
+    # Remove date pattern at the end: (DD.MM.YYYY)
+    subject = re.sub(r'\s*\(\d{2}\.\d{2}\.\d{4}\)\s*$', '', subject)
+    
+    # Remove date pattern at the beginning: DD-MM
+    subject = re.sub(r'^\d{2}-\d{2}\s+', '', subject)
+    
+    # Try to split by common address patterns
+    # Pattern 1: "Объект ул Адрес"
+    if ' ул ' in subject.lower():
+        parts = re.split(r'\s+ул\s+', subject, 1, flags=re.IGNORECASE)
+        if len(parts) == 2:
+            object_name = parts[0].strip()
+            address = f"ул {parts[1].strip()}"
+    # Pattern 2: "Объект г Город ул Адрес"
+    elif ' г ' in subject.lower() and ' ул ' in subject.lower():
+        parts = re.split(r'\s+г\s+', subject, 1, flags=re.IGNORECASE)
+        if len(parts) == 2:
+            object_name = parts[0].strip()
+            address = parts[1].strip()
+    # Pattern 3: "Объект, Адрес" (old format)
+    elif ',' in subject:
+        parts = subject.split(',', 1)
+        object_name = parts[0].strip()
+        address = parts[1].strip() if len(parts) > 1 else None
+    # Pattern 4: "Распечатка: Объект, Адрес" (old format)
+    elif 'Распечатка:' in subject:
         parts = subject.split('Распечатка:')[1].strip()
         if ',' in parts:
             parts_list = parts.split(',', 1)
@@ -187,8 +247,55 @@ def parse_subject(subject: str) -> tuple:
             address = parts_list[1].strip() if len(parts_list) > 1 else None
         else:
             object_name = parts.strip()
+    else:
+        # Fallback: use entire subject as object name
+        object_name = subject.strip()
     
     return object_name, address
+
+
+def extract_address_from_body(email_message) -> Optional[str]:
+    """Извлечь адрес из тела письма"""
+    try:
+        for part in email_message.walk():
+            content_type = part.get_content_type()
+            if content_type == 'text/plain' or content_type == 'text/html':
+                body = part.get_payload(decode=True)
+                if body:
+                    try:
+                        text = body.decode('utf-8', errors='ignore')
+                    except:
+                        text = body.decode('windows-1251', errors='ignore')
+                    
+                    # Ищем адрес по паттернам
+                    # Паттерн 1: "Адрес: ул. Ленина 1" или "Адрес: г. Москва, ул. Ленина, 1"
+                    address_match = re.search(r'Адрес[:\s]+([^\n]+)', text, re.IGNORECASE)
+                    if address_match:
+                        address = address_match.group(1).strip()
+                        # Очищаем от HTML тегов если есть
+                        address = re.sub(r'<[^>]+>', '', address)
+                        return address
+                    
+                    # Паттерн 2: Ищем "ул." или "улица" в тексте
+                    street_match = re.search(r'(г\.\s*[^,]+[,\s]+)?(ул\.?\s*[^,\n]+(\d+)?)', text, re.IGNORECASE)
+                    if street_match:
+                        return street_match.group(0).strip()
+                    
+                    # Паттерн 3: Ищем типичные адресные паттерны
+                    addr_patterns = [
+                        r'г\.\s*[^,]+[,\s]+ул\.?\s*[^,\n]+',
+                        r'ул\.?\s*[^,\n]+,\s*д\.?\s*\d+',
+                        r'город\s+[^,]+[,\s]+улица\s+[^,\n]+',
+                    ]
+                    for pattern in addr_patterns:
+                        match = re.search(pattern, text, re.IGNORECASE)
+                        if match:
+                            return match.group(0).strip()
+        
+        return None
+    except Exception as e:
+        logger.error(f"Error extracting address from body: {e}")
+        return None
 
 @celery_app.task(bind=True)
 def fetch_emails_task(self):
@@ -214,6 +321,25 @@ def fetch_emails_task(self):
             try:
                 logger.info(f"Processing message: subject='{msg_data['subject']}', attachments={len(msg_data.get('attachments', []))}")
                 
+                # Handle MDN (read receipt)
+                if msg_data.get('is_mdn'):
+                    original_msg_id = msg_data.get('original_message_id')
+                    if original_msg_id:
+                        # Find sent attachment by original_message_id
+                        sent_attachments = db.query(Attachment).filter(
+                            Attachment.original_message_id == original_msg_id
+                        ).all()
+                        
+                        for att in sent_attachments:
+                            att.read_receipt_received = True
+                            att.read_receipt_at = datetime.now(timezone.utc)
+                            logger.info(f"Read receipt received for attachment {att.id}")
+                        
+                        if sent_attachments:
+                            db.commit()
+                            logger.info(f"Updated {len(sent_attachments)} attachments with read receipt")
+                    continue
+                
                 # Check if already exists
                 existing = db.query(IncomingMessage).filter(
                     IncomingMessage.provider_message_id == msg_data['provider_message_id']
@@ -228,18 +354,28 @@ def fetch_emails_task(self):
                     logger.info(f"Sender {msg_data['from_email']} not allowed")
                     continue
                 
-                # Get source_id for noreply@eldis24.ru
+                # Get source_id for noreply@example.com
                 source = db.query(EmailSource).filter(
-                    EmailSource.email == 'noreply@eldis24.ru',
+                    EmailSource.email == 'noreply@example.com',
                     EmailSource.is_active == True
                 ).first()
                 
                 if not source:
-                    logger.error("Email source noreply@eldis24.ru not found")
+                    logger.error("Email source noreply@example.com not found")
                     continue
                 
                 # Parse subject
                 object_name, address = parse_subject(msg_data['subject'])
+                
+                # Если адрес не найден в теме, пробуем извлечь из тела письма
+                if not address and msg_data.get('raw_content'):
+                    try:
+                        email_msg = email.message_from_bytes(msg_data['raw_content'])
+                        address = extract_address_from_body(email_msg)
+                        if address:
+                            logger.info(f"Extracted address from body: {address}")
+                    except Exception as e:
+                        logger.error(f"Error extracting address from body: {e}")
                 
                 # Create message
                 message = IncomingMessage(
@@ -266,11 +402,24 @@ def fetch_emails_task(self):
                         upload_path = UPLOAD_DIR
                         os.makedirs(upload_path, exist_ok=True)
                         
-                        # Use unique filename: original_name_hash.pdf
-                        base_name = att_data['filename']
-                        if not base_name.lower().endswith('.pdf'):
-                            base_name += '.pdf'
-                        file_path = os.path.join(upload_path, f"{att_data['file_sha256'][:16]}_{base_name}")
+                        # Create sent_filename: "Объект - Адрес.pdf"
+                        sent_filename = None
+                        if object_name and address:
+                            sent_filename = f"{object_name} - {address}.pdf"
+                        elif object_name:
+                            sent_filename = f"{object_name}.pdf"
+                        else:
+                            sent_filename = att_data['filename']
+                        
+                        # Clean filename from invalid characters
+                        sent_filename = re.sub(r'[<>"/\\|?*]', '', sent_filename)
+                        
+                        # Ensure .pdf extension
+                        if not sent_filename.lower().endswith('.pdf'):
+                            sent_filename += '.pdf'
+                        
+                        # Use unique filename: hash_sent_filename.pdf
+                        file_path = os.path.join(upload_path, f"{att_data['file_sha256'][:16]}_{sent_filename}")
                         with open(file_path, 'wb') as f:
                             f.write(att_data['content'])
                         
@@ -278,6 +427,7 @@ def fetch_emails_task(self):
                         attachment = Attachment(
                             message_id=message.id,
                             filename=att_data['filename'],
+                            sent_filename=sent_filename,
                             file_path=file_path,
                             file_sha256=att_data['file_sha256'],
                             file_size=att_data['file_size'],

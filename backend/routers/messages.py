@@ -1,12 +1,13 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
+from sqlalchemy import or_
 from typing import List, Optional
 from datetime import datetime
 from uuid import UUID
 from pydantic import BaseModel
-
 from database import get_db
 from models import IncomingMessage as MessageModel, Attachment as AttachmentModel, Object as ObjectModel
+from utils import decode_email_header
 
 router = APIRouter()
 
@@ -38,6 +39,7 @@ class Attachment(AttachmentBase):
     message_id: UUID
     object_id: Optional[UUID]
     filename: str
+    sent_filename: Optional[str]
     file_path: Optional[str]
     file_sha256: str
     file_size: Optional[int]
@@ -48,6 +50,9 @@ class Attachment(AttachmentBase):
     gpt_response: Optional[dict]
     sent_to_email: Optional[str]
     sent_at: Optional[datetime]
+    read_receipt_received: Optional[bool] = False
+    read_receipt_at: Optional[datetime] = None
+    original_message_id: Optional[str] = None
     created_at: datetime
 
     class Config:
@@ -55,7 +60,7 @@ class Attachment(AttachmentBase):
 
 class AttachmentWithObject(Attachment):
     object: Optional[dict] = None
-    message: Optional[Message] = None
+    message: Optional[dict] = None
 
 # Messages endpoints
 @router.get("/messages", response_model=List[Message])
@@ -104,6 +109,9 @@ async def list_attachments(
     message_id: Optional[UUID] = Query(None),
     date_from: Optional[datetime] = Query(None),
     date_to: Optional[datetime] = Query(None),
+    search: Optional[str] = Query(None, description="Search by object name, calculator number, or email"),
+    sort_by: Optional[str] = Query(None, description="Sort field: created_at, sent_at, status, filename"),
+    sort_order: Optional[str] = Query("desc", regex="^(asc|desc)$"),
     db: Session = Depends(get_db)
 ):
     """Получить список вложений с фильтрами"""
@@ -122,17 +130,61 @@ async def list_attachments(
     if date_to:
         query = query.filter(AttachmentModel.created_at <= date_to)
     
-    attachments = query.order_by(AttachmentModel.created_at.desc()).offset(skip).limit(limit).all()
+    # Search by object name, calculator number, or sent email
+    if search:
+        search_pattern = f"%{search}%"
+        query = query.filter(
+            or_(
+                ObjectModel.name.ilike(search_pattern),
+                ObjectModel.calculator_number.ilike(search_pattern),
+                ObjectModel.email.ilike(search_pattern),
+                AttachmentModel.sent_to_email.ilike(search_pattern),
+                AttachmentModel.filename.ilike(search_pattern)
+            )
+        )
+    
+    # Sorting
+    sort_column = getattr(AttachmentModel, sort_by, AttachmentModel.created_at) if sort_by else AttachmentModel.created_at
+    if sort_order == "asc":
+        query = query.order_by(sort_column.asc())
+    else:
+        query = query.order_by(sort_column.desc())
+    
+    attachments = query.offset(skip).limit(limit).all()
     
     # Add object info if available
     result = []
     for attachment in attachments:
-        attachment_dict = attachment.__dict__.copy()
+        attachment_dict = {
+            'id': attachment.id,
+            'message_id': attachment.message_id,
+            'object_id': attachment.object_id,
+            'filename': attachment.filename,
+            'sent_filename': attachment.sent_filename,
+            'file_path': attachment.file_path,
+            'file_sha256': attachment.file_sha256,
+            'file_size': attachment.file_size,
+            'calculator_number': attachment.calculator_number,
+            'status': attachment.status,
+            'reject_reason': attachment.reject_reason,
+            'validation_result': attachment.validation_result,
+            'gpt_response': attachment.gpt_response,
+            'sent_to_email': attachment.sent_to_email,
+            'sent_at': attachment.sent_at,
+            'created_at': attachment.created_at
+        }
         if attachment.object:
             attachment_dict['object'] = {
                 'id': attachment.object.id,
                 'name': attachment.object.name,
                 'email': attachment.object.email
+            }
+        if attachment.message:
+            attachment_dict['message'] = {
+                'id': attachment.message.id,
+                'subject': attachment.message.subject,
+                'from_email': decode_email_header(attachment.message.from_email),
+                'received_at': attachment.message.received_at
             }
         result.append(AttachmentWithObject(**attachment_dict))
     
@@ -145,12 +197,39 @@ async def get_attachment(attachment_id: UUID, db: Session = Depends(get_db)):
     if not attachment:
         raise HTTPException(status_code=404, detail="Attachment not found")
     
-    attachment_dict = attachment.__dict__.copy()
+    attachment_dict = {
+        'id': attachment.id,
+        'message_id': attachment.message_id,
+        'object_id': attachment.object_id,
+        'filename': attachment.filename,
+        'sent_filename': attachment.sent_filename,
+        'file_path': attachment.file_path,
+        'file_sha256': attachment.file_sha256,
+        'file_size': attachment.file_size,
+        'calculator_number': attachment.calculator_number,
+        'status': attachment.status,
+        'reject_reason': attachment.reject_reason,
+        'validation_result': attachment.validation_result,
+        'gpt_response': attachment.gpt_response,
+        'sent_to_email': attachment.sent_to_email,
+        'sent_at': attachment.sent_at,
+        'read_receipt_received': attachment.read_receipt_received or False,
+        'read_receipt_at': attachment.read_receipt_at,
+        'original_message_id': attachment.original_message_id,
+        'created_at': attachment.created_at
+    }
     if attachment.object:
         attachment_dict['object'] = {
             'id': attachment.object.id,
             'name': attachment.object.name,
             'email': attachment.object.email
+        }
+    if attachment.message:
+        attachment_dict['message'] = {
+            'id': attachment.message.id,
+            'subject': attachment.message.subject,
+            'from_email': decode_email_header(attachment.message.from_email),
+            'received_at': attachment.message.received_at
         }
     
     return AttachmentWithObject(**attachment_dict)

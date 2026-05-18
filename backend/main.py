@@ -24,9 +24,10 @@ app = FastAPI(
 )
 
 # CORS middleware
+cors_origins = os.getenv("CORS_ORIGINS", "http://localhost").split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # В проде ограничить
+    allow_origins=[origin.strip() for origin in cors_origins],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -46,61 +47,17 @@ async def root():
 async def health_check():
     return {"status": "healthy"}
 
-# Pydantic models
-from pydantic import BaseModel, EmailStr
-from uuid import UUID
-from datetime import datetime
+# Include routers first to test imports, then schemas are loaded via routers
+from routers import objects, email_sources, messages, reports, actions, auth, settings
 
-class ObjectBase(BaseModel):
-    name: str
-    calculator_number: Optional[str] = None
-    address: Optional[str] = None
-    email: Optional[str] = None  # Can be comma-separated: "a@test.com, b@test.com"
+# Import schemas after routers to avoid circular imports
+from schemas import (
+    Object, ObjectCreate, ObjectUpdate,
+    EmailSource, EmailSourceCreate, EmailSourceUpdate
+)
 
-class ObjectCreate(ObjectBase):
-    pass
-
-class ObjectUpdate(BaseModel):
-    name: Optional[str] = None
-    calculator_number: Optional[str] = None
-    address: Optional[str] = None
-    email: Optional[str] = None  # Can be comma-separated
-    is_active: Optional[bool] = None
-
-class Object(ObjectBase):
-    id: UUID
-    name_norm: str
-    is_active: bool
-    created_at: datetime
-    updated_at: datetime
-
-    class Config:
-        from_attributes = True
-
-class EmailSourceBase(BaseModel):
-    email: EmailStr
-    name: Optional[str] = None
-
-class EmailSourceCreate(EmailSourceBase):
-    pass
-
-class EmailSourceUpdate(BaseModel):
-    email: Optional[EmailStr] = None
-    name: Optional[str] = None
-    is_active: Optional[bool] = None
-
-class EmailSource(EmailSourceBase):
-    id: UUID
-    is_active: bool
-    created_at: datetime
-    updated_at: datetime
-
-    class Config:
-        from_attributes = True
-
-# Include routers
-from routers import objects, email_sources, messages, reports, actions
-
+app.include_router(auth.router, prefix="/api/v1/auth", tags=["auth"])
+app.include_router(settings.router, prefix="/api/v1/settings", tags=["settings"])
 app.include_router(objects.router, prefix="/api/v1/objects", tags=["objects"])
 app.include_router(email_sources.router, prefix="/api/v1/email-sources", tags=["email-sources"])
 app.include_router(messages.router, prefix="/api/v1", tags=["messages"])

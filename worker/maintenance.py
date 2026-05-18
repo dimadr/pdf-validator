@@ -2,7 +2,8 @@ from celery_app import celery_app
 from utils import logger
 from database import get_db
 from models import Attachment, IncomingMessage
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
+from sqlalchemy import text
 import os
 import subprocess
 
@@ -46,7 +47,7 @@ def cleanup_old_files(self):
     """Удалить старые файлы и записи"""
     logger.info("Starting cleanup task")
     
-    cutoff_date = datetime.utcnow() - timedelta(days=30)  # Keep 30 days
+    cutoff_date = datetime.now(timezone.utc) - timedelta(days=30)  # Keep 30 days
     
     with get_db() as db:
         try:
@@ -88,7 +89,7 @@ def health_check(self):
     logger.info("Starting health check")
     
     health_status = {
-        'timestamp': datetime.utcnow().isoformat(),
+        'timestamp': datetime.now(timezone.utc).isoformat(),
         'services': {},
         'overall_status': 'healthy'
     }
@@ -96,7 +97,7 @@ def health_check(self):
     with get_db() as db:
         try:
             # Check database connection
-            db.execute("SELECT 1")
+            db.execute(text("SELECT 1"))
             health_status['services']['database'] = 'healthy'
         except Exception as e:
             health_status['services']['database'] = f'unhealthy: {str(e)}'
@@ -105,7 +106,7 @@ def health_check(self):
         try:
             # Check message processing
             recent_messages = db.query(IncomingMessage).filter(
-                IncomingMessage.received_at > datetime.utcnow() - timedelta(hours=1)
+                IncomingMessage.received_at > datetime.now(timezone.utc) - timedelta(hours=1)
             ).count()
             health_status['services']['message_processing'] = {
                 'status': 'healthy',

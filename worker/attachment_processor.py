@@ -2,7 +2,7 @@ import email
 import os
 import hashlib
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict, Optional, Tuple
 
 from celery_app import celery_app, UPLOAD_DIR
@@ -39,11 +39,11 @@ def parse_subject(subject: str) -> Tuple[Optional[str], Optional[str]]:
     if not subject:
         return None, None
     
-    # Простая логика - ищем шаблоны в теме
+    import re
     object_name = None
     address = None
     
-    # Пример: "Распечатка: ООО Ромашка, ул. Ленина, 1"
+    # Вариант 1: "Распечатка: ООО Ромашка, ул. Ленина, 1"
     if 'Распечатка:' in subject:
         parts = subject.split('Распечатка:')[1].strip()
         if ',' in parts:
@@ -52,6 +52,22 @@ def parse_subject(subject: str) -> Tuple[Optional[str], Optional[str]]:
             address = address_part.strip()
         else:
             object_name = parts.strip()
+    # Вариант 2: "ИП Тверской, ул. Ленина 1" или "ООО Ромашка - ул. Ленина, 1"
+    elif ',' in subject or ' - ' in subject:
+        # Пробуем разделить по запятой или тире
+        for separator in [',', ' - ']:
+            if separator in subject:
+                parts = subject.split(separator, 1)
+                if len(parts) == 2:
+                    object_name = parts[0].strip()
+                    address = parts[1].strip()
+                    break
+    
+    # Очистка от кавычек
+    if object_name:
+        object_name = object_name.strip('"\'').strip()
+    if address:
+        address = address.strip('"\'').strip()
     
     return object_name, address
 
@@ -106,92 +122,11 @@ def process_message_attachments(self, message_id: str):
         
         # Update message status
         message.status = 'done'
-        message.processed_at = datetime.utcnow()
+        message.processed_at = datetime.now(timezone.utc)
         db.commit()
         
+        logger.info(f"Processed message {message_id}")
         return {'status': 'success', 'attachments_found': 0}
-        
-        email_message = email.message_from_bytes(raw_content)
-        
-        # Extract PDF attachments
-        attachments_data = AttachmentExtractor.extract_pdf_attachments(email_message)
-        
-        if not attachments_data:
-            logger.info(f"No PDF attachments found in message {message_id}")
-            # Update message status
-            message.status = 'done'
-            message.processed_at = datetime.utcnow()
-            db.commit()
-            return {'status': 'success', 'attachments_found': 0}
-        
-        # Parse subject for object and address
-        object_name, address = parse_subject(message.subject or '')
-        message.parsed_object = object_name
-        message.parsed_address = address
-        
-        processed_count = 0
-        upload_dir = ensure_upload_dir()
-        
-        for attachment_data in attachments_data:
-            try:
-                # Check if attachment already exists by hash
-                existing = db.query(Attachment).filter(
-                    Attachment.file_sha256 == attachment_data['file_sha256']
-                ).first()
-                
-                if existing:
-                    logger.info(f"Attachment with hash {attachment_data['file_sha256']} already exists")
-                    continue
-                
-                # Find associated object
-                target_object = None
-                if object_name:
-                    target_object = find_object_by_name(object_name, db)
-                
-                # Save file to disk
-                file_path = os.path.join(upload_dir, attachment_data['filename'])
-                with open(file_path, 'wb') as f:
-                    f.write(attachment_data['content'])
-                
-                # Create attachment record
-                attachment = Attachment(
-                    message_id=message_id,
-                    object_id=target_object.id if target_object else None,
-                    filename=attachment_data['filename'],
-                    file_path=file_path,
-                    file_sha256=attachment_data['file_sha256'],
-                    file_size=attachment_data['file_size'],
-                    status='new'
-                )
-                
-                db.add(attachment)
-                db.commit()
-                db.refresh(attachment)
-                
-                # Queue PDF validation
-                from pdf_validator import validate_pdf_attachment as validate_pdf_task
-                validate_pdf_task.delay(attachment.id)
-                
-                processed_count += 1
-                logger.info(f"Created attachment {attachment.id}")
-                
-            except Exception as e:
-                logger.error(f"Error processing attachment: {e}")
-                db.rollback()
-                continue
-        
-        # Update message status
-        message.status = 'processing'
-        message.processed_at = datetime.utcnow()
-        db.commit()
-        
-        logger.info(f"Processed {processed_count} attachments for message {message_id}")
-        return {
-            'status': 'success',
-            'attachments_processed': processed_count,
-            'object_name': object_name,
-            'address': address
-        }
         
     except Exception as e:
         logger.error(f"Error processing message attachments: {e}")

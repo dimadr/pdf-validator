@@ -4,13 +4,15 @@ from typing import List, Optional
 
 from database import get_db
 from models import EmailSource as EmailSourceModel
-from main import EmailSource, EmailSourceCreate, EmailSourceUpdate
+from schemas import EmailSource, EmailSourceCreate, EmailSourceUpdate
+from routers.auth import get_current_user, require_admin
+from models import User as UserModel
 
 router = APIRouter()
 
 @router.post("/", response_model=EmailSource)
-async def create_email_source(source: EmailSourceCreate, db: Session = Depends(get_db)):
-    """Добавить новый разрешенный email"""
+async def create_email_source(source: EmailSourceCreate, db: Session = Depends(get_db), current_user: UserModel = Depends(require_admin)):
+    """Добавить новый разрешенный email (только админ)"""
     # Check if email already exists
     existing = db.query(EmailSourceModel).filter(EmailSourceModel.email == source.email).first()
     if existing:
@@ -59,9 +61,10 @@ async def get_email_source(source_id: str, db: Session = Depends(get_db)):
 async def update_email_source(
     source_id: str,
     source_update: EmailSourceUpdate,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(require_admin)
 ):
-    """Обновить источник"""
+    """Обновить источник (только админ)"""
     source = db.query(EmailSourceModel).filter(EmailSourceModel.id == source_id).first()
     if not source:
         raise HTTPException(status_code=404, detail="Email source not found")
@@ -85,19 +88,18 @@ async def update_email_source(
     return source
 
 @router.delete("/{source_id}")
-async def delete_email_source(source_id: str, db: Session = Depends(get_db)):
-    """Удалить источник"""
+async def delete_email_source(source_id: str, db: Session = Depends(get_db), current_user: UserModel = Depends(require_admin)):
+    """Удалить источник (только админ)"""
     source = db.query(EmailSourceModel).filter(EmailSourceModel.id == source_id).first()
     if not source:
         raise HTTPException(status_code=404, detail="Email source not found")
-    
     db.delete(source)
     db.commit()
-    return {"message": "Email source deleted successfully"}
+    return {"message": "Email source deleted"}
 
 @router.post("/{source_id}/disable")
-async def disable_email_source(source_id: str, db: Session = Depends(get_db)):
-    """Отключить источник (мягкое удаление)"""
+async def disable_email_source(source_id: str, db: Session = Depends(get_db), current_user: UserModel = Depends(require_admin)):
+    """Отключить источник (мягкое удаление) (только админ)"""
     source = db.query(EmailSourceModel).filter(EmailSourceModel.id == source_id).first()
     if not source:
         raise HTTPException(status_code=404, detail="Email source not found")
