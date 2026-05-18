@@ -6,7 +6,4 @@ from email_sender import send_pdf_attachment
 
 from maintenance import cleanup_old_files, health_check
 
-# Import scheduler to register beat schedule
-import scheduler
-
 # All tasks are now registered

@@ -1,25 +1,122 @@
 class EmailProcessorAdmin {
     constructor() {
         this.apiBase = '/api/v1';
+        this.token = localStorage.getItem('token');
+        this.currentUser = null;
         this.init();
     }
 
     async init() {
         await this.checkConnection();
-        await this.loadStatistics();
+        await this.checkAuth();
         this.setupEventListeners();
-        await this.loadObjects();
-        await this.loadEmailSources();
-        await this.loadDocuments();
-        await this.loadReports();
         
-        // Автообновление статистики каждые 30 секунд
-        setInterval(() => this.loadStatistics(), 30000);
+        if (this.token) {
+            await this.loadStatistics();
+            await this.loadObjects();
+            await this.loadEmailSources();
+            await this.loadDocuments();
+            await this.loadReports();
+            await this.loadUsers();
+            await this.loadTrustedEmails();
+            await this.loadAIConfig();
+            await this.loadEmailConfig();
+            
+            setInterval(() => this.loadStatistics(), 30000);
+        }
+    }
+
+    async checkAuth() {
+        if (this.token) {
+            try {
+                this.currentUser = await this.apiCall('/auth/me', {
+                    headers: { 'Authorization': `Bearer ${this.token}` }
+                });
+                this.showLoggedInState();
+            } catch (error) {
+                this.logout();
+            }
+        } else {
+            this.showLoginModal();
+        }
+    }
+
+    showLoggedInState() {
+        document.getElementById('loginModal').querySelector('.btn-close')?.remove();
+        bootstrap.Modal.getOrCreateInstance(document.getElementById('loginModal')).hide();
+        document.getElementById('user-info').style.display = 'inline';
+        document.getElementById('username').textContent = this.currentUser.username;
+        document.getElementById('logout-btn').style.display = 'inline';
+        
+        // Show/hide settings based on role
+        const isAdmin = this.currentUser.role === 'admin';
+        
+        // Hide settings tab for non-admin
+        if (!isAdmin) {
+            const settingsTab = document.querySelector('#settings-tab');
+            if (settingsTab) settingsTab.style.display = 'none';
+            
+            // Also try other selectors for settings
+            const settingsLinks = document.querySelectorAll('[data-bs-target="#settings"]');
+            settingsLinks.forEach(el => el.style.display = 'none');
+        }
+        
+        // Hide "Добавить объект" button for non-admin
+        const addObjectBtn = document.querySelector('#objectModal')?.closest('.d-flex')?.querySelector('.btn-primary');
+        if (!isAdmin) {
+            // Find the "Добавить объект" button
+            const objectsTab = document.getElementById('objects');
+            if (objectsTab) {
+                const buttons = objectsTab.querySelectorAll('.btn-primary');
+                buttons.forEach(btn => {
+                    if (btn.getAttribute('data-bs-target') === '#objectModal') {
+                        btn.style.display = 'none';
+                    }
+                });
+            }
+        }
+    }
+
+    showLoginModal() {
+        bootstrap.Modal.getOrCreateInstance(document.getElementById('loginModal'), { backdrop: 'static' }).show();
+    }
+
+    async login(username, password) {
+        const response = await fetch(`${this.apiBase}/auth/login`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username, password })
+        });
+        
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.detail || 'Ошибка входа');
+        }
+        
+        const data = await response.json();
+        this.token = data.access_token;
+        localStorage.setItem('token', this.token);
+        
+        this.currentUser = await this.apiCall('/auth/me', {
+            headers: { 'Authorization': `Bearer ${this.token}` }
+        });
+        
+        this.showLoggedInState();
+        window.location.reload();
+    }
+
+    logout() {
+        this.token = null;
+        this.currentUser = null;
+        localStorage.removeItem('token');
+        document.getElementById('user-info').style.display = 'none';
+        document.getElementById('logout-btn').style.display = 'none';
+        this.showLoginModal();
     }
 
     async checkConnection() {
         try {
-            const response = await fetch(`${this.apiBase}/health`);
+            const response = await fetch('/health');
             const statusEl = document.getElementById('connection-status');
             if (response.ok) {
                 statusEl.innerHTML = '<i class="bi bi-circle-fill text-success"></i> Подключено';
@@ -33,14 +130,25 @@ class EmailProcessorAdmin {
     }
 
     async apiCall(endpoint, options = {}) {
+        const headers = {
+            'Content-Type': 'application/json',
+            ...options.headers
+        };
+        
+        if (this.token) {
+            headers['Authorization'] = `Bearer ${this.token}`;
+        }
+        
         try {
             const response = await fetch(`${this.apiBase}${endpoint}`, {
-                headers: {
-                    'Content-Type': 'application/json',
-                    ...options.headers
-                },
+                headers,
                 ...options
             });
+            
+            if (response.status === 401) {
+                this.logout();
+                throw new Error('Сессия истекла');
+            }
             
             if (!response.ok) {
                 let errorMessage = `HTTP ${response.status}: ${response.statusText}`;
@@ -49,14 +157,12 @@ class EmailProcessorAdmin {
                     const errorData = await response.json();
                     if (errorData.detail) {
                         if (Array.isArray(errorData.detail)) {
-                            // Pydantic validation errors
                             errorMessage = errorData.detail.map(err => err.msg || err).join(', ');
                         } else if (typeof errorData.detail === 'string') {
                             errorMessage = errorData.detail;
                         }
                     }
                 } catch (e) {
-                    // Ignore JSON parsing errors
                 }
                 
                 throw new Error(errorMessage);
@@ -65,7 +171,6 @@ class EmailProcessorAdmin {
             return await response.json();
         } catch (error) {
             console.error(`API Error: ${endpoint}`, error);
-            // Don't show alert here, let the caller handle it
             throw error;
         }
     }
@@ -100,18 +205,35 @@ class EmailProcessorAdmin {
 
     async loadObjects() {
         try {
-            const objects = await this.apiCall('/objects/');
+            const searchTerm = document.getElementById('search-objects')?.value || '';
+            const periodFilter = document.getElementById('period-filter')?.value || '';
+            const sortBy = document.getElementById('sort-by')?.value || '';
+            
+            let url = '/objects/';
+            const params = new URLSearchParams();
+            if (searchTerm) params.append('search', searchTerm);
+            if (periodFilter) params.append('period', periodFilter);
+            if (sortBy) params.append('sort_by', sortBy);
+            if (params.toString()) url += '?' + params.toString();
+            
+            const objects = await this.apiCall(url);
             const tbody = document.querySelector('#objects-table tbody');
             tbody.innerHTML = '';
             
             objects.forEach(obj => {
                 const row = tbody.insertRow();
                 row.innerHTML = `
+                    <td>${obj.eldis_id || '-'}</td>
+                    <td>${obj.object_date || '-'}</td>
                     <td>${obj.name}</td>
                     <td>${obj.calculator_number || '-'}</td>
                     <td>${obj.address || '-'}</td>
                     <td>${obj.email || '-'}</td>
-                    <td><span class="badge bg-${obj.is_active ? 'success' : 'secondary'}">${obj.is_active ? 'Активен' : 'Неактивен'}</span></td>
+                    <td>
+                        <button class="btn btn-sm btn-link" onclick="admin.toggleObjectStatus('${obj.id}', ${obj.is_active})" title="${obj.is_active ? 'Деактивировать' : 'Активировать'}">
+                            <span class="badge bg-${obj.is_active ? 'success' : 'secondary'}">${obj.is_active ? 'Активен' : 'Неактивен'}</span>
+                        </button>
+                    </td>
                     <td>
                         <button class="btn btn-sm btn-outline-primary" onclick="admin.editObject('${obj.id}')">
                             <i class="bi bi-pencil"></i>
@@ -157,8 +279,23 @@ class EmailProcessorAdmin {
     async loadDocuments(statusFilter = '') {
         try {
             let endpoint = '/attachments';
+            const params = [];
+            
+            const searchTerm = document.getElementById('search-documents')?.value || '';
+            if (searchTerm) {
+                params.push(`search=${encodeURIComponent(searchTerm)}`);
+            }
+            
             if (statusFilter) {
-                endpoint += `?status=${statusFilter}`;
+                params.push(`status=${statusFilter}`);
+            }
+            
+            const sortBy = document.getElementById('sort-attachments')?.value || 'created_at';
+            params.push(`sort_by=${sortBy}`);
+            params.push('sort_order=desc');
+            
+            if (params.length > 0) {
+                endpoint += '?' + params.join('&');
             }
             
             const attachments = await this.apiCall(endpoint);
@@ -170,13 +307,13 @@ class EmailProcessorAdmin {
                 const statusBadge = this.getStatusBadge(att.status);
                 
                 row.innerHTML = `
-                    <td>${att.filename}</td>
+                    <td>${att.sent_filename || att.filename}</td>
                     <td>${att.calculator_number || '-'}</td>
                     <td>${att.object ? att.object.name : '-'}</td>
                     <td>${att.message ? att.message.from_email : '-'}</td>
                     <td>${statusBadge}</td>
                     <td>${att.reject_reason || '-'}</td>
-                    <td>${new Date(att.created_at).toLocaleString()}</td>
+                    <td>${new Date(att.created_at + 'Z').toLocaleString('ru-RU', {timeZone: 'Europe/Moscow'})}</td>
                     <td>
                         <button class="btn btn-sm btn-outline-info" onclick="admin.showAttachmentDetails('${att.id}')">
                             <i class="bi bi-eye"></i>
@@ -211,7 +348,7 @@ class EmailProcessorAdmin {
                     <td>${rej.object_name || '-'}</td>
                     <td>${rej.message_subject || '-'}</td>
                     <td>${rej.from_email || '-'}</td>
-                    <td>${new Date(rej.created_at).toLocaleString()}</td>
+                    <td>${new Date(rej.created_at + 'Z').toLocaleString('ru-RU', {timeZone: 'Europe/Moscow'})}</td>
                 `;
             });
         } catch (error) {
@@ -256,6 +393,8 @@ class EmailProcessorAdmin {
             const formData = new FormData(form);
             
             const data = {
+                eldis_id: formData.get('eldis_id') || null,
+                object_date: formData.get('object_date') || null,
                 name: formData.get('name'),
                 calculator_number: formData.get('calculator_number') || null,
                 address: formData.get('address') || null,
@@ -330,6 +469,21 @@ class EmailProcessorAdmin {
             this.loadDocuments(e.target.value);
         });
 
+        // Поиск документов
+        document.getElementById('search-documents')?.addEventListener('input', (e) => {
+            this.loadDocuments(document.getElementById('status-filter').value);
+        });
+
+        // Сортировка документов
+        document.getElementById('sort-attachments')?.addEventListener('change', (e) => {
+            this.loadDocuments(document.getElementById('status-filter').value);
+        });
+
+        // Поиск объектов
+        document.getElementById('search-objects')?.addEventListener('input', (e) => {
+            this.loadObjects();
+        });
+
         // Кнопки обновления
         document.getElementById('refresh-documents').addEventListener('click', () => {
             this.loadDocuments(document.getElementById('status-filter').value);
@@ -338,6 +492,167 @@ class EmailProcessorAdmin {
         document.getElementById('refresh-reports').addEventListener('click', () => {
             this.loadReports();
         });
+
+        // Вход
+        document.getElementById('login-btn').addEventListener('click', async () => {
+            const username = document.getElementById('login-username').value;
+            const password = document.getElementById('login-password').value;
+            const errorEl = document.getElementById('login-error');
+            
+            try {
+                errorEl.style.display = 'none';
+                await this.login(username, password);
+            } catch (error) {
+                errorEl.textContent = error.message;
+                errorEl.style.display = 'block';
+            }
+        });
+
+        // Выход
+        document.getElementById('logout-btn').addEventListener('click', () => {
+            this.logout();
+        });
+
+        // Сохранение пользователя
+        document.getElementById('save-user').addEventListener('click', async () => {
+            const form = document.getElementById('user-form');
+            const userId = form.getAttribute('data-user-id');
+            const formData = new FormData(form);
+            
+            const data = {
+                username: formData.get('username'),
+                email: formData.get('email') || null,
+                role: formData.get('role')
+            };
+            
+            const password = formData.get('password');
+            if (password) {
+                data.password = password;
+            }
+            
+            try {
+                if (userId) {
+                    await this.apiCall(`/auth/users/${userId}`, {
+                        method: 'PUT',
+                        body: JSON.stringify(data)
+                    });
+                    this.showAlert('Пользователь обновлен', 'success');
+                } else {
+                    data.password = password;
+                    await this.apiCall('/auth/register', {
+                        method: 'POST',
+                        body: JSON.stringify(data)
+                    });
+                    this.showAlert('Пользователь добавлен', 'success');
+                }
+                bootstrap.Modal.getInstance(document.getElementById('userModal')).hide();
+                form.reset();
+                form.removeAttribute('data-user-id');
+                await this.loadUsers();
+            } catch (error) {
+                this.showAlert(error.message, 'danger');
+            }
+        });
+
+        // Сброс формы пользователя при закрытии модалки
+        document.getElementById('userModal').addEventListener('hidden.bs.modal', () => {
+            const form = document.getElementById('user-form');
+            form.reset();
+            form.removeAttribute('data-user-id');
+            document.querySelector('#userModal .modal-title').textContent = 'Добавить пользователя';
+            document.getElementById('user-password').required = true;
+            document.getElementById('password-hint').style.display = 'none';
+        });
+
+        // Сохранение доверенного email
+        document.getElementById('save-trusted-email').addEventListener('click', async () => {
+            const form = document.getElementById('trusted-email-form');
+            const formData = new FormData(form);
+            
+            const data = {
+                email: formData.get('email'),
+                description: formData.get('description') || null
+            };
+            
+            try {
+                await this.apiCall('/settings/trusted-emails', {
+                    method: 'POST',
+                    body: JSON.stringify(data)
+                });
+                bootstrap.Modal.getInstance(document.getElementById('trustedEmailModal')).hide();
+                form.reset();
+                await this.loadTrustedEmails();
+                this.showAlert('Email добавлен', 'success');
+            } catch (error) {
+                this.showAlert(error.message, 'danger');
+            }
+        });
+
+        // Сохранение AI конфига
+        document.getElementById('ai-config-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const data = {
+                router_ai_url: document.getElementById('router-ai-url').value || null,
+                router_ai_key: document.getElementById('router-ai-key').value || null,
+                neuro_api_url: document.getElementById('neuro-api-url').value || null,
+                neuro_api_key: document.getElementById('neuro-api-key').value || null
+            };
+            
+            try {
+                await this.apiCall('/settings/ai-config', {
+                    method: 'PUT',
+                    body: JSON.stringify(data)
+                });
+                this.showAlert('Настройки сохранены', 'success');
+            } catch (error) {
+                this.showAlert(error.message, 'danger');
+            }
+        });
+
+        // Сохранение email конфига
+        document.getElementById('email-config-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const data = {
+                imap_server: document.getElementById('imap-server').value || null,
+                imap_port: parseInt(document.getElementById('imap-port').value) || null,
+                imap_ssl: document.getElementById('imap-ssl').checked,
+                smtp_server: document.getElementById('smtp-server').value || null,
+                smtp_port: parseInt(document.getElementById('smtp-port').value) || null,
+                smtp_ssl: document.getElementById('smtp-ssl').checked,
+                email_username: document.getElementById('email-username').value || null,
+                email_password: document.getElementById('email-password').value || null,
+                email_from_name: document.getElementById('email-from-name').value || null
+            };
+            
+            try {
+                await this.apiCall('/settings/email-config', {
+                    method: 'PUT',
+                    body: JSON.stringify(data)
+                });
+                this.showAlert('Настройки почты сохранены', 'success');
+            } catch (error) {
+                this.showAlert(error.message, 'danger');
+            }
+        });
+    }
+
+    async toggleObjectStatus(id, currentStatus) {
+        const newStatus = !currentStatus;
+        const action = newStatus ? 'активировать' : 'деактивировать';
+        if (!confirm(`Вы уверены, что хотите ${action} этот объект?`)) return;
+        
+        try {
+            await this.apiCall(`/objects/${id}`, {
+                method: 'PUT',
+                body: JSON.stringify({ is_active: newStatus })
+            });
+            await this.loadObjects();
+            this.showAlert(`Объект ${newStatus ? 'активирован' : 'деактивирован'}`, 'success');
+        } catch (error) {
+            this.showAlert('Ошибка при изменении статуса', 'danger');
+        }
     }
 
     async deleteObject(id) {
@@ -363,6 +678,8 @@ class EmailProcessorAdmin {
             form.setAttribute('data-mode', 'edit');
             form.setAttribute('data-object-id', id);
             
+            form.querySelector('input[name="eldis_id"]').value = obj.eldis_id || '';
+            form.querySelector('input[name="object_date"]').value = obj.object_date || '';
             form.querySelector('input[name="name"]').value = obj.name;
             form.querySelector('input[name="calculator_number"]').value = obj.calculator_number || '';
             form.querySelector('input[name="address"]').value = obj.address || '';
@@ -507,6 +824,136 @@ class EmailProcessorAdmin {
             
         } catch (error) {
             this.showAlert('Ошибка при загрузке деталей вложения', 'danger');
+        }
+    }
+
+    async loadUsers() {
+        try {
+            const users = await this.apiCall('/auth/users');
+            const tbody = document.querySelector('#users-table tbody');
+            tbody.innerHTML = '';
+            
+                users.forEach(user => {
+                const row = tbody.insertRow();
+                row.innerHTML = `
+                    <td>${user.username}</td>
+                    <td>${user.email || '-'}</td>
+                    <td><span class="badge bg-${user.role === 'admin' ? 'danger' : 'primary'}">${user.role === 'admin' ? 'Админ' : 'Оператор'}</span></td>
+                    <td><span class="badge bg-${user.is_active ? 'success' : 'secondary'}">${user.is_active ? 'Активен' : 'Неактивен'}</span></td>
+                    <td>
+                        <button class="btn btn-sm btn-outline-primary" onclick="admin.editUser('${user.id}')">
+                            <i class="bi bi-pencil"></i>
+                        </button>
+                        ${user.id !== this.currentUser?.id ? 
+                            `<button class="btn btn-sm btn-outline-danger" onclick="admin.deleteUser('${user.id}')">
+                                <i class="bi bi-trash"></i>
+                            </button>` : ''}
+                    </td>
+                `;
+            });
+        } catch (error) {
+            console.error('Failed to load users:', error);
+        }
+    }
+
+    async deleteUser(id) {
+        if (!confirm('Удалить этого пользователя?')) return;
+        
+        try {
+            await this.apiCall(`/auth/users/${id}`, { method: 'DELETE' });
+            await this.loadUsers();
+            this.showAlert('Пользователь удален', 'success');
+        } catch (error) {
+            this.showAlert('Ошибка при удалении пользователя', 'danger');
+        }
+    }
+
+    async editUser(id) {
+        try {
+            const user = await this.apiCall(`/auth/users/${id}`);
+            
+            const form = document.getElementById('user-form');
+            form.setAttribute('data-user-id', id);
+            
+            document.querySelector('#userModal .modal-title').textContent = 'Редактировать пользователя';
+            document.getElementById('user-password').required = false;
+            document.getElementById('password-hint').style.display = 'inline';
+            
+            document.getElementById('user-username').value = user.username;
+            document.getElementById('user-email').value = user.email || '';
+            document.getElementById('user-role').value = user.role;
+            document.getElementById('user-password').value = '';
+            
+            const modalEl = document.getElementById('userModal');
+            const modal = new bootstrap.Modal(modalEl);
+            modal.show();
+        } catch (error) {
+            this.showAlert('Ошибка при загрузке пользователя', 'danger');
+        }
+    }
+
+    async loadTrustedEmails() {
+        try {
+            const emails = await this.apiCall('/settings/trusted-emails');
+            const tbody = document.querySelector('#trusted-emails-table tbody');
+            tbody.innerHTML = '';
+            
+            emails.forEach(email => {
+                const row = tbody.insertRow();
+                row.innerHTML = `
+                    <td>${email.email}</td>
+                    <td>${email.description || '-'}</td>
+                    <td><span class="badge bg-${email.is_active ? 'success' : 'secondary'}">${email.is_active ? 'Активен' : 'Неактивен'}</span></td>
+                    <td>
+                        <button class="btn btn-sm btn-outline-danger" onclick="admin.deleteTrustedEmail('${email.id}')">
+                            <i class="bi bi-trash"></i>
+                        </button>
+                    </td>
+                `;
+            });
+        } catch (error) {
+            console.error('Failed to load trusted emails:', error);
+        }
+    }
+
+    async deleteTrustedEmail(id) {
+        if (!confirm('Удалить этот адрес?')) return;
+        
+        try {
+            await this.apiCall(`/settings/trusted-emails/${id}`, { method: 'DELETE' });
+            await this.loadTrustedEmails();
+            this.showAlert('Адрес удален', 'success');
+        } catch (error) {
+            this.showAlert('Ошибка при удалении адреса', 'danger');
+        }
+    }
+
+    async loadAIConfig() {
+        try {
+            const config = await this.apiCall('/settings/ai-config');
+            document.getElementById('router-ai-url').value = config.router_ai_url || '';
+            document.getElementById('router-ai-key').value = config.router_ai_key || '';
+            document.getElementById('neuro-api-url').value = config.neuro_api_url || '';
+            document.getElementById('neuro-api-key').value = config.neuro_api_key || '';
+        } catch (error) {
+            console.error('Failed to load AI config:', error);
+        }
+    }
+
+    async loadEmailConfig() {
+        try {
+            const config = await this.apiCall('/settings/email-config');
+            document.getElementById('imap-server').value = config.imap_server || '';
+            document.getElementById('imap-port').value = config.imap_port || '';
+            document.getElementById('imap-ssl').checked = config.imap_ssl !== false;
+            document.getElementById('smtp-server').value = config.smtp_server || '';
+            document.getElementById('smtp-port').value = config.smtp_port || '';
+            document.getElementById('smtp-ssl').checked = config.smtp_ssl !== false;
+            document.getElementById('email-username').value = config.email_username || '';
+            document.getElementById('email-password').value = '';
+            document.getElementById('email-from-name').value = config.email_from_name || '';
+        } catch (error) {
+            console.error('Failed to load email config:', error);
         }
     }
 }

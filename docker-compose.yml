@@ -97,10 +97,13 @@ services:
     container_name: project1-ui
     restart: always
     ports:
-      - "4321:80"
+      - "4321:443"
+      - "8080:80"
     volumes:
       - ./ui:/usr/share/nginx/html
       - ./ui/nginx.conf:/etc/nginx/nginx.conf
+      - /etc/ssl/mycert.pem:/etc/nginx/ssl/cert.pem:ro
+      - /etc/ssl/mycert-key.pem:/etc/nginx/ssl/key.pem:ro
     depends_on:
       - backend
 

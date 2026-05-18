@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Email Processor Admin</title>
+    <link rel="icon" type="image/svg+xml" href="favicon.svg">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.7.2/font/bootstrap-icons.css" rel="stylesheet">
 </head>
@@ -17,6 +18,12 @@
                 <span class="navbar-text" id="connection-status">
                     <i class="bi bi-circle-fill text-warning"></i> Подключение...
                 </span>
+                <span class="navbar-text ms-3" id="user-info" style="display: none;">
+                    <i class="bi bi-person"></i> <span id="username"></span>
+                </span>
+                <button class="btn btn-outline-light btn-sm ms-3" id="logout-btn" style="display: none;">
+                    <i class="bi bi-box-arrow-right"></i> Выйти
+                </button>
             </div>
         </div>
     </nav>
@@ -80,6 +87,11 @@
                     <i class="bi bi-graph-up"></i> Отчёты
                 </button>
             </li>
+            <li class="nav-item" role="presentation">
+                <button class="nav-link" id="settings-tab" data-bs-toggle="tab" data-bs-target="#settings" type="button" role="tab">
+                    <i class="bi bi-gear"></i> Настройки
+                </button>
+            </li>
         </ul>
 
         <div class="tab-content mt-3" id="mainTabsContent">
@@ -91,10 +103,32 @@
                         <i class="bi bi-plus"></i> Добавить объект
                     </button>
                 </div>
+                <div class="d-flex justify-content-between align-items-center mb-3">
+                    <div class="d-flex gap-2">
+                        <input type="text" class="form-control" id="search-objects" placeholder="Поиск" style="width: 300px;">
+                        <button class="btn btn-outline-primary" onclick="admin.loadObjects()">
+                            <i class="bi bi-search"></i> Поиск
+                        </button>
+                        <input type="text" class="form-control" id="period-filter" placeholder="Период" style="width: 100px;">
+                        <select class="form-select" id="sort-by" style="width: 150px;">
+                            <option value="">Сортировка</option>
+                            <option value="name">По названию</option>
+                            <option value="eldis_id">По ID</option>
+                            <option value="object_date">По периоду</option>
+                            <option value="calculator_number">По № вычислителя</option>
+                            <option value="created_at">По дате создания</option>
+                        </select>
+                        <button class="btn btn-outline-secondary" onclick="admin.loadObjects()">
+                            <i class="bi bi-filter"></i> Фильтр
+                        </button>
+                    </div>
+                </div>
                 <div class="table-responsive">
                     <table class="table table-striped" id="objects-table">
                         <thead>
                             <tr>
+                                <th>ID</th>
+                                <th>Период отчета</th>
                                 <th>Название</th>
                                 <th>№ вычислителя</th>
                                 <th>Адрес</th>
@@ -134,11 +168,12 @@
             <!-- Документы -->
             <div class="tab-pane fade" id="documents" role="tabpanel">
                 <div class="row mb-3">
-                    <div class="col-md-6">
+                    <div class="col-md-3">
                         <h4>Документы</h4>
                     </div>
-                    <div class="col-md-6">
+                    <div class="col-md-9">
                         <div class="d-flex gap-2">
+                            <input type="text" class="form-control" id="search-documents" placeholder="Поиск" style="width: 200px;">
                             <select class="form-select" id="status-filter">
                                 <option value="">Все статусы</option>
                                 <option value="new">Новые</option>
@@ -146,6 +181,11 @@
                                 <option value="validated">Проверены</option>
                                 <option value="sent">Отправлены</option>
                                 <option value="rejected">Отклонены</option>
+                            </select>
+                            <select class="form-select" id="sort-attachments" style="width: 150px;">
+                                <option value="created_at">По дате (новые)</option>
+                                <option value="sent_at">По дате отправки</option>
+                                <option value="filename">По имени</option>
                             </select>
                             <button class="btn btn-outline-secondary" id="refresh-documents">
                                 <i class="bi bi-arrow-clockwise"></i>
@@ -201,6 +241,179 @@
                     </table>
                 </div>
             </div>
+
+            <!-- Настройки -->
+            <div class="tab-pane fade" id="settings" role="tabpanel">
+                <ul class="nav nav-pills mb-3" id="settingsTabs" role="tablist">
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link active" id="users-settings-tab" data-bs-toggle="pill" data-bs-target="#users-settings" type="button">
+                            <i class="bi bi-people"></i> Пользователи
+                        </button>
+                    </li>
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link" id="trusted-tab" data-bs-toggle="pill" data-bs-target="#trusted-settings" type="button">
+                            <i class="bi bi-envelope-check"></i> Доверенные адреса
+                        </button>
+                    </li>
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link" id="ai-tab" data-bs-toggle="pill" data-bs-target="#ai-settings" type="button">
+                            <i class="bi bi-cpu"></i> AI/API
+                        </button>
+                    </li>
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link" id="email-out-tab" data-bs-toggle="pill" data-bs-target="#email-out-settings" type="button">
+                            <i class="bi bi-envelope"></i> Почта
+                        </button>
+                    </li>
+                </ul>
+
+                <div class="tab-content" id="settingsTabsContent">
+                    <!-- Пользователи -->
+                    <div class="tab-pane fade show active" id="users-settings" role="tabpanel">
+                        <div class="d-flex justify-content-between align-items-center mb-3">
+                            <h4>Пользователи</h4>
+                            <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#userModal">
+                                <i class="bi bi-plus"></i> Добавить пользователя
+                            </button>
+                        </div>
+                        <div class="table-responsive">
+                            <table class="table table-striped" id="users-table">
+                                <thead>
+                                    <tr>
+                                        <th>Имя пользователя</th>
+                                        <th>Email</th>
+                                        <th>Роль</th>
+                                        <th>Статус</th>
+                                        <th>Действия</th>
+                                    </tr>
+                                </thead>
+                                <tbody></tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    <!-- Доверенные адреса -->
+                    <div class="tab-pane fade" id="trusted-settings" role="tabpanel">
+                        <div class="d-flex justify-content-between align-items-center mb-3">
+                            <h4>Доверенные адреса</h4>
+                            <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#trustedEmailModal">
+                                <i class="bi bi-plus"></i> Добавить адрес
+                            </button>
+                        </div>
+                        <div class="table-responsive">
+                            <table class="table table-striped" id="trusted-emails-table">
+                                <thead>
+                                    <tr>
+                                        <th>Email</th>
+                                        <th>Описание</th>
+                                        <th>Статус</th>
+                                        <th>Действия</th>
+                                    </tr>
+                                </thead>
+                                <tbody></tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    <!-- AI/API -->
+                    <div class="tab-pane fade" id="ai-settings" role="tabpanel">
+                        <h4>Настройки AI/API</h4>
+                        <div class="card">
+                            <div class="card-body">
+                                <form id="ai-config-form">
+                                    <h5 class="card-title">RouterAI</h5>
+                                    <div class="mb-3">
+                                        <label class="form-label">URL</label>
+                                        <input type="text" class="form-control" id="router-ai-url" placeholder="http://localhost:11434">
+                                    </div>
+                                    <div class="mb-3">
+                                        <label class="form-label">API Key</label>
+                                        <input type="password" class="form-control" id="router-ai-key" placeholder="API Key">
+                                    </div>
+                                    <hr>
+                                    <h5 class="card-title">NeuroApi</h5>
+                                    <div class="mb-3">
+                                        <label class="form-label">URL</label>
+                                        <input type="text" class="form-control" id="neuro-api-url" placeholder="http://neuro.local">
+                                    </div>
+                                    <div class="mb-3">
+                                        <label class="form-label">API Key</label>
+                                        <input type="password" class="form-control" id="neuro-api-key" placeholder="API Key">
+                                    </div>
+                                    <button type="submit" class="btn btn-primary">
+                                        <i class="bi bi-save"></i> Сохранить
+                                    </button>
+                                </form>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Email -->
+                    <div class="tab-pane fade" id="email-out-settings" role="tabpanel">
+                        <h4>Настройки почты</h4>
+                        <div class="card">
+                            <div class="card-body">
+                                <form id="email-config-form">
+                                    <h5 class="card-title">IMAP</h5>
+                                    <div class="row">
+                                        <div class="col-md-6 mb-3">
+                                            <label class="form-label">IMAP сервер</label>
+                                            <input type="text" class="form-control" id="imap-server" placeholder="imap.example.com">
+                                        </div>
+                                        <div class="col-md-3 mb-3">
+                                            <label class="form-label">Порт</label>
+                                            <input type="number" class="form-control" id="imap-port" placeholder="993">
+                                        </div>
+                                        <div class="col-md-3 mb-3">
+                                            <div class="form-check mt-4">
+                                                <input class="form-check-input" type="checkbox" id="imap-ssl" checked>
+                                                <label class="form-check-label" for="imap-ssl">SSL</label>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <hr>
+                                    <h5 class="card-title">SMTP</h5>
+                                    <div class="row">
+                                        <div class="col-md-6 mb-3">
+                                            <label class="form-label">SMTP сервер</label>
+                                            <input type="text" class="form-control" id="smtp-server" placeholder="smtp.example.com">
+                                        </div>
+                                        <div class="col-md-3 mb-3">
+                                            <label class="form-label">Порт</label>
+                                            <input type="number" class="form-control" id="smtp-port" placeholder="465">
+                                        </div>
+                                        <div class="col-md-3 mb-3">
+                                            <div class="form-check mt-4">
+                                                <input class="form-check-input" type="checkbox" id="smtp-ssl" checked>
+                                                <label class="form-check-label" for="smtp-ssl">SSL</label>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <hr>
+                                    <h5 class="card-title">Учетные данные</h5>
+                                    <div class="row">
+                                        <div class="col-md-6 mb-3">
+                                            <label class="form-label">Email</label>
+                                            <input type="email" class="form-control" id="email-username" placeholder="user@example.com">
+                                        </div>
+                                        <div class="col-md-6 mb-3">
+                                            <label class="form-label">Пароль / App Password</label>
+                                            <input type="password" class="form-control" id="email-password" placeholder="Пароль">
+                                        </div>
+                                    </div>
+                                    <div class="mb-3">
+                                        <label class="form-label">Имя отправителя</label>
+                                        <input type="text" class="form-control" id="email-from-name" placeholder="Имя отправителя">
+                                    </div>
+                                    <button type="submit" class="btn btn-primary">
+                                        <i class="bi bi-save"></i> Сохранить
+                                    </button>
+                                </form>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
         </div>
     </div>
 
@@ -214,6 +427,14 @@
                 </div>
                 <div class="modal-body">
                     <form id="object-form">
+                        <div class="mb-3">
+                            <label class="form-label">ID</label>
+                            <input type="text" class="form-control" name="eldis_id">
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Период отчета</label>
+                            <input type="text" class="form-control" name="object_date" placeholder="23-24">
+                        </div>
                         <div class="mb-3">
                             <label class="form-label">Название объекта</label>
                             <input type="text" class="form-control" name="name" required>
@@ -264,6 +485,100 @@
                 <div class="modal-footer">
                     <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Отмена</button>
                     <button type="button" class="btn btn-primary" id="save-email-source">Сохранить</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Модальное окно входа -->
+    <div class="modal fade" id="loginModal" tabindex="-1" data-bs-backdrop="static">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">Вход в систему</h5>
+                </div>
+                <div class="modal-body">
+                    <form id="login-form">
+                        <div class="mb-3">
+                            <label class="form-label">Имя пользователя</label>
+                            <input type="text" class="form-control" id="login-username" required>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Пароль</label>
+                            <input type="password" class="form-control" id="login-password" required>
+                        </div>
+                        <div class="alert alert-danger" id="login-error" style="display: none;"></div>
+                    </form>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-primary" id="login-btn">Войти</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Модальное окно пользователей -->
+    <div class="modal fade" id="userModal" tabindex="-1">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">Добавить пользователя</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <form id="user-form">
+                        <div class="mb-3">
+                            <label class="form-label">Имя пользователя</label>
+                            <input type="text" class="form-control" name="username" id="user-username" required>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Email</label>
+                            <input type="email" class="form-control" name="email" id="user-email">
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Пароль <span id="password-hint">(оставьте пустым для сохранения текущего)</span></label>
+                            <input type="password" class="form-control" name="password" id="user-password">
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Роль</label>
+                            <select class="form-select" name="role" id="user-role">
+                                <option value="operator">Оператор</option>
+                                <option value="admin">Администратор</option>
+                            </select>
+                        </div>
+                    </form>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Отмена</button>
+                    <button type="button" class="btn btn-primary" id="save-user">Сохранить</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Модальное окно доверенных адресов -->
+    <div class="modal fade" id="trustedEmailModal" tabindex="-1">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">Добавить доверенный адрес</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <form id="trusted-email-form">
+                        <div class="mb-3">
+                            <label class="form-label">Email</label>
+                            <input type="email" class="form-control" name="email" required>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Описание</label>
+                            <input type="text" class="form-control" name="description">
+                        </div>
+                    </form>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Отмена</button>
+                    <button type="button" class="btn btn-primary" id="save-trusted-email">Сохранить</button>
                 </div>
             </div>
         </div>

@@ -1,4 +1,5 @@
 import smtplib
+import uuid
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
@@ -6,7 +7,10 @@ from email import encoders
 import os
 from typing import Optional, Dict
 import re
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+
+# Moscow timezone
+MOSCOW_TZ = timezone(timedelta(hours=3))
 import sys
 
 # Add parent directory to path for imports
@@ -58,123 +62,186 @@ class EmailSender:
         
         return filename or "document.pdf"
     
-    def send_email_with_pdf(
-        self, 
-        to_email: str, 
-        subject: str, 
-        body: str, 
-        pdf_path: str, 
-        pdf_filename: str
-    ) -> Dict:
-        """Отправить email с PDF вложением"""
-        logger.info(f"[EMAIL] Starting send_email_with_pdf to {to_email}")
-        try:
-            logger.info("[EMAIL] Creating message...")
-            # Create message
-            message = MIMEMultipart()
-            message["From"] = self.username
-            message["To"] = to_email
-            message["Subject"] = subject
-            
-            # Add body
-            message.attach(MIMEText(body, "plain", "utf-8"))
-            
-            # Add PDF attachment
-            if os.path.exists(pdf_path):
-                with open(pdf_path, "rb") as attachment:
-                    part = MIMEBase("application", "pdf")
-                    part.set_payload(attachment.read())
-                
-                encoders.encode_base64(part)
-                # Use RFC 5987 encoding for UTF-8 filename (without extra quotes)
-                # Encode filename to UTF-8 bytes and then to percent-encoding
-                filename_bytes = pdf_filename.encode('utf-8')
-                encoded_filename = ''.join([f'%{b:02X}' for b in filename_bytes])
-                part.add_header(
-                    "Content-Disposition",
-                    f"attachment; filename*=UTF-8''{encoded_filename}"
+    def _find_object_for_attachment(self, db, attachment) -> Optional[Object]:
+        """Найти объект для вложения: exact → partial → fallback по имени"""
+        obj = None
+        
+        if not attachment.calculator_number:
+            return None
+        
+        # 1. Exact match по calculator_number
+        obj = db.query(Object).filter(
+            Object.calculator_number == attachment.calculator_number,
+            Object.is_active == True
+        ).first()
+        if obj:
+            return obj
+        
+        # 2. Partial match (первые 3+ цифры)
+        calc_num_digits = re.match(r'^\d+', attachment.calculator_number)
+        if calc_num_digits and len(calc_num_digits.group()) >= 3:
+            digits_only = calc_num_digits.group()
+            candidates = db.query(Object).filter(
+                Object.calculator_number.like(f"{digits_only}%"),
+                Object.is_active == True
+            ).all()
+            valid_candidates = [c for c in candidates if c.calculator_number and c.email]
+            if len(valid_candidates) == 1:
+                obj = valid_candidates[0]
+                logger.info(f"Found object by partial match (single match): {obj.name} ({obj.calculator_number})")
+            elif len(valid_candidates) > 1:
+                logger.warning(
+                    f"Multiple objects match calculator {digits_only}%, not sending (require manual review): "
+                    f"{[c.name for c in valid_candidates]}"
                 )
-                message.attach(part)
-            else:
-                raise Exception(f"PDF file not found: {pdf_path}")
+                return None
+        
+        # 3. Fallback: если номер короткий (<3 цифр), ищем по object_name из PDF
+        if not obj and len(attachment.calculator_number) < 3:
+            obj_name_from_pdf = None
+            if attachment.validation_result:
+                obj_name_from_pdf = attachment.validation_result.get('object_name')
+            if not obj_name_from_pdf and attachment.message:
+                obj_name_from_pdf = attachment.message.parsed_object
             
-            # Connect to SMTP server and send with timeout
-            logger.info(f"[SMTP] Connecting to {self.smtp_server}:{self.smtp_port}")
+            if obj_name_from_pdf:
+                search_name = obj_name_from_pdf.lower().strip()
+                candidates = db.query(Object).filter(
+                    Object.name.ilike(f"%{search_name}%"),
+                    Object.is_active == True
+                ).all()
+                
+                if not candidates:
+                    search_base = re.sub(r'№\s*\d+.*$', '', search_name).strip()
+                    if search_base:
+                        candidates = db.query(Object).filter(
+                            Object.name.ilike(f"%{search_base}%"),
+                            Object.is_active == True
+                        ).all()
+                
+                # Match by address if we have address from PDF
+                if candidates and attachment.validation_result:
+                    addr_from_pdf = attachment.validation_result.get('address', '').lower()
+                    if addr_from_pdf:
+                        matching = []
+                        for c in candidates:
+                            if c.address:
+                                c_addr = c.address.lower()
+                                if any(part in c_addr for part in addr_from_pdf.split() if len(part) > 4):
+                                    matching.append(c)
+                        if matching:
+                            candidates = matching
+                
+                valid_candidates = [c for c in candidates if c.calculator_number and c.email]
+                if len(valid_candidates) == 1:
+                    obj = valid_candidates[0]
+                    logger.info(f"Found object by object_name fallback: {obj.name} ({obj.calculator_number})")
+                elif len(valid_candidates) > 1:
+                    logger.warning(
+                        f"Multiple objects match name '{obj_name_from_pdf}', sending to admin: "
+                        f"{[c.name for c in valid_candidates]}"
+                    )
+        
+        return obj
+    
+    def _build_message(
+        self,
+        to_email: str,
+        subject: str,
+        body: str,
+        pdf_path: str,
+        pdf_filename: str
+    ) -> MIMEMultipart:
+        """Сформировать MIME-сообщение с PDF-вложением"""
+        message = MIMEMultipart()
+        message["From"] = self.username
+        message["To"] = to_email
+        message["Subject"] = subject
+        message["Disposition-Notification-To"] = self.username
+        message["X-Priority"] = "3"
+        message["Message-ID"] = f"<{uuid.uuid4()}@email-sender>"
+        
+        message.attach(MIMEText(body, "plain", "utf-8"))
+        
+        if os.path.exists(pdf_path):
+            with open(pdf_path, "rb") as f:
+                part = MIMEBase("application", "pdf")
+                part.set_payload(f.read())
+            encoders.encode_base64(part)
+            filename_bytes = pdf_filename.encode('utf-8')
+            encoded_filename = ''.join([f'%{b:02X}' for b in filename_bytes])
+            part.add_header(
+                "Content-Disposition",
+                f"attachment; filename*=UTF-8''{encoded_filename}"
+            )
+            message.attach(part)
+        else:
+            raise Exception(f"PDF file not found: {pdf_path}")
+        
+        return message
+    
+    def _connect_smtp(self):
+        """Установить SMTP-соединение и авторизоваться"""
+        if self.smtp_port == 465:
+            logger.info("[SMTP] Using SSL connection")
+            server = smtplib.SMTP_SSL(self.smtp_server, self.smtp_port, timeout=10)
+        else:
+            logger.info("[SMTP] Using STARTTLS connection")
+            server = smtplib.SMTP(self.smtp_server, self.smtp_port, timeout=10)
+        
+        logger.info("[SMTP] Connection established")
+        
+        if self.smtp_port != 465:
+            logger.info("[SMTP] Starting TLS...")
+            server.starttls()
+            logger.info("[SMTP] TLS started")
+        
+        logger.info(f"[SMTP] Logging in as {self.username}")
+        server.login(self.username, self.password)
+        logger.info("[SMTP] Login successful")
+        return server
+    
+    def send_email_with_pdf(
+        self,
+        to_email: str,
+        subject: str,
+        body: str,
+        pdf_path: str,
+        pdf_filename: str,
+        server=None
+    ) -> Dict:
+        """Отправить email с PDF вложением.
+        Если server передан — использует существующее SMTP-соединение.
+        """
+        logger.info(f"[EMAIL] Starting send_email_with_pdf to {to_email}")
+        own_connection = False
+        
+        try:
+            message = self._build_message(to_email, subject, body, pdf_path, pdf_filename)
+            message_id = message["Message-ID"]
             
-            try:
-                if self.smtp_port == 465:
-                    # SSL connection for port 465
-                    logger.info("[SMTP] Using SSL connection")
-                    server = smtplib.SMTP_SSL(self.smtp_server, self.smtp_port, timeout=10)
-                else:
-                    # STARTTLS for port 25/2525
-                    logger.info("[SMTP] Using STARTTLS connection")
-                    server = smtplib.SMTP(self.smtp_server, self.smtp_port, timeout=10)
-                
-                logger.info("[SMTP] Connection established")
-                
-                if self.smtp_port != 465:
-                    logger.info("[SMTP] Starting TLS...")
-                    server.starttls()
-                    logger.info("[SMTP] TLS started")
-                
-                logger.info(f"[SMTP] Logging in as {self.username}")
-                server.login(self.username, self.password)
-                logger.info("[SMTP] Login successful")
-                
-                text = message.as_string()
-                logger.info(f"[SMTP] Sending email to {to_email}...")
-                
-                server.sendmail(self.username, to_email, text)
-                logger.info("[SMTP] Email sent successfully!")
-                
-                server.quit()
-                logger.info("[SMTP] Connection closed")
-                
-            except Exception as e:
-                logger.error(f"[SMTP] Error during send: {e}")
-                raise
+            if server is None:
+                server = self._connect_smtp()
+                own_connection = True
             
-            logger.info(f"Email sent successfully to {to_email}")
-            return {"status": "success", "to_email": to_email}
+            text = message.as_string()
+            logger.info(f"[SMTP] Sending email to {to_email}...")
+            server.sendmail(self.username, to_email, text)
+            logger.info("[SMTP] Email sent successfully!")
+            
+            return {"status": "success", "to_email": to_email, "message_id": message_id}
             
         except Exception as e:
             logger.error(f"Error sending email to {to_email}: {e}")
             return {"status": "error", "message": str(e)}
+        finally:
+            if own_connection and server:
+                try:
+                    server.quit()
+                    logger.info("[SMTP] Connection closed")
+                except Exception:
+                    pass
     
-    def find_recipient_for_attachment(self, attachment: Attachment, db) -> Optional[str]:
-        """Найти получателя для вложения по объекту"""
-        try:
-            # Try to match object by parsed object name from message
-            if attachment.message and attachment.message.parsed_object:
-                object_name = attachment.message.parsed_object
-                normalized_name = re.sub(r'[^\w\s]', '', object_name.lower().strip())
-                
-                # Search for object in database
-                obj = db.query(Object).filter(
-                    Object.name_norm.contains(normalized_name),
-                    Object.is_active == True
-                ).first()
-                
-                if obj and obj.email:
-                    return obj.email
-            
-            # If no match via parsed object, try direct object_id match
-            if attachment.object_id:
-                obj = db.query(Object).filter(
-                    Object.id == attachment.object_id,
-                    Object.is_active == True
-                ).first()
-                
-                if obj and obj.email:
-                    return obj.email
-            
-            return None
-            
-        except Exception as e:
-            logger.error(f"Error finding recipient for attachment {attachment.id}: {e}")
-            return None
-
 @celery_app.task(bind=True, max_retries=3)
 def send_pdf_attachment(self, attachment_id: str):
     """Отправить PDF вложение найденному получателю"""
@@ -196,71 +263,50 @@ def send_pdf_attachment(self, attachment_id: str):
         
         # Determine recipients based on status
         recipients = []
+        obj = None
         
         if attachment.status == 'approved':
-            # Все поля заполнены - ищем объект по номеру вычислителя
             if attachment.calculator_number:
-                # Ищем объект с таким номером вычислителя
-                obj = db.query(Object).filter(
-                    Object.calculator_number == attachment.calculator_number,
-                    Object.is_active == True
-                ).first()
+                obj = sender._find_object_for_attachment(db, attachment)
+                
                 if obj and obj.email:
-                    # Поддержка нескольких email через запятую
                     email_list = [e.strip() for e in obj.email.split(',') if e.strip()]
                     recipients.extend(email_list)
                     logger.info(f"Attachment {attachment_id} approved, found object {obj.name}, sending to {email_list}")
             
-            # Если не нашли объект или у него нет email - отправляем на ddr@it37.ru (тестовый режим)
             if not recipients:
-                recipients = ['ddr@it37.ru']
-                logger.info(f"Attachment {attachment_id} approved, object not found or no email, sending to ddr@it37.ru")
+                recipients = ['admin@example.com']
+                logger.warning(f"Attachment {attachment_id} approved, object not found or no email, sending to admin")
         else:
-            # rejected (есть пустые ячейки) - отправляем админам
-            recipients = ['dv@it37.ru']
-            logger.info(f"Attachment {attachment_id} rejected, sending to admin: dv@it37.ru")
+            recipients = ['admin@example.com']
+            logger.info(f"Attachment {attachment_id} rejected, sending to admin: admin@example.com")
         
-        # Get object name and address from DB object or message
-        object_name = None
-        address = None
+        # Get object name and address (reuse found object or fallback to message)
+        if obj:
+            object_name = obj.name
+            address = obj.address
+        else:
+            object_name = attachment.message.parsed_object if attachment.message else None
+            address = attachment.message.parsed_address if attachment.message else None
         
-        # Try to get from object (if found by calculator number)
-        if attachment.calculator_number:
-            obj = db.query(Object).filter(
-                Object.calculator_number == attachment.calculator_number,
-                Object.is_active == True
-            ).first()
-            if obj:
-                object_name = obj.name
-                address = obj.address
+        object_name = object_name or "Документ"
+        address = address or "Без адреса"
         
-        # Fallback to message parsing if object not found
-        if not object_name:
-            object_name = attachment.message.parsed_object or "Документ"
-        if not address:
-            address = attachment.message.parsed_address or "Без адреса"
-        
-        # Create filename: "Имя объекта - Адрес.pdf"
-        safe_filename = f"{object_name} - {address}.pdf"
-        
-        # Clean filename from invalid characters
-        safe_filename = re.sub(r'[<>"/\\|?*]', '', safe_filename)
-        
-        # Ensure .pdf extension
-        if not safe_filename.lower().endswith('.pdf'):
-            safe_filename += '.pdf'
+        # Generate safe filename
+        if attachment.sent_filename:
+            safe_filename = attachment.sent_filename
+        else:
+            safe_filename = sender.create_safe_filename(object_name, address)
         
         # Prepare email based on status
         if attachment.status == 'rejected':
-            # Получаем информацию о пустых ячейках
             empty_cells_info = []
             if attachment.validation_result and 'tables' in attachment.validation_result:
                 tables_result = attachment.validation_result['tables']
                 empty_cells_info = tables_result.get('errors', [])
             
             subject = f"⚠️ ВНИМАНИЕ: Пропуски в данных - {object_name}"
-            body = f"""
-Здравствуйте!
+            body = f"""Здравствуйте!
 
 Во вложении находится документ по объекту: {object_name}
 Адрес: {address}
@@ -270,70 +316,74 @@ def send_pdf_attachment(self, attachment_id: str):
 Проблемы ({len(empty_cells_info)}):
 {chr(10).join(empty_cells_info[:10])}{'...' if len(empty_cells_info) > 10 else ''}
 
-Дата получения: {attachment.created_at.strftime('%d.%m.%Y %H:%M')}
+Дата получения: {datetime.now(MOSCOW_TZ).strftime('%d.%m.%Y %H:%M')}
 
 ---
-Это автоматическое сообщение, пожалуйста, не отвечайте на него.
-            """
+Это автоматическое сообщение, пожалуйста, не отвечайте на него."""
         else:
-            subject = "Отчет о теплопотреблении"
-            body = f"""
-Здравствуйте!
+            subject = f"Отчет {object_name} - {address}" if address != "Без адреса" else f"Отчет {object_name}"
+            body = f"""Здравствуйте!
 
-Во вложении находится документ по объекту: {object_name}
+Мы запускаем автоматическую рассылку отчётов. Если вы обнаружили какие‑либо неточности в отчёте, пожалуйста, сообщите об этом:
+    по электронной почте: admin@example.com
+    или по телефону: +7 902 318-86-89 Дмитрий.
+
+Во вложении находится отчет:
 Адрес: {address}
 
-Дата получения: {attachment.created_at.strftime('%d.%m.%Y %H:%M')}
+Дата получения сообщения: {datetime.now(MOSCOW_TZ).strftime('%d.%m.%Y %H:%M')}
 
 ---
-Это автоматическое сообщение, пожалуйста, не отвечайте на него.
-            """
+Это автоматическое сообщение, пожалуйста, не отвечайте на него."""
         
-        # Send email to all recipients
+        # Add admin2@example.com for rejected attachments
+        if attachment.status == 'rejected' and 'admin2@example.com' not in recipients:
+            recipients.append('admin2@example.com')
+        
+        # Send to all recipients using single SMTP connection
         sent_to = []
         failed_to = []
+        message_id = None
+        server = None
         
-        for recipient in recipients:
-            try:
-                result = sender.send_email_with_pdf(
-                    to_email=recipient,
-                    subject=subject,
-                    body=body.strip(),
-                    pdf_path=attachment.file_path,
-                    pdf_filename=safe_filename
-                )
-                
-                if result['status'] == 'success':
-                    sent_to.append(recipient)
-                    logger.info(f"Attachment {attachment_id} sent successfully to {recipient}")
-                else:
-                    failed_to.append(f"{recipient}: {result.get('message', 'unknown error')}")
-                    logger.error(f"Failed to send attachment {attachment_id} to {recipient}: {result.get('message')}")
-            except Exception as e:
-                failed_to.append(f"{recipient}: {str(e)}")
-                logger.error(f"Exception sending attachment {attachment_id} to {recipient}: {e}")
-        
-        # Если rejected - отправляем также np@it37.ru (в дополнение к основным)
-        if attachment.status == 'rejected' and 'np@it37.ru' not in recipients:
-            try:
-                result = sender.send_email_with_pdf(
-                    to_email='np@it37.ru',
-                    subject=subject,
-                    body=body.strip(),
-                    pdf_path=attachment.file_path,
-                    pdf_filename=safe_filename
-                )
-                if result['status'] == 'success':
-                    sent_to.append('np@it37.ru')
-                    logger.info(f"Attachment {attachment_id} also sent to np@it37.ru")
-            except Exception as e:
-                logger.error(f"Failed to send to np@it37.ru: {e}")
+        try:
+            server = sender._connect_smtp()
+            
+            for recipient in recipients:
+                try:
+                    result = sender.send_email_with_pdf(
+                        to_email=recipient,
+                        subject=subject,
+                        body=body.strip(),
+                        pdf_path=attachment.file_path,
+                        pdf_filename=safe_filename,
+                        server=server
+                    )
+                    
+                    if result['status'] == 'success':
+                        sent_to.append(recipient)
+                        message_id = result.get('message_id')
+                        logger.info(f"Attachment {attachment_id} sent successfully to {recipient}")
+                    else:
+                        failed_to.append(f"{recipient}: {result.get('message', 'unknown error')}")
+                        logger.error(f"Failed to send attachment {attachment_id} to {recipient}: {result.get('message')}")
+                except Exception as e:
+                    failed_to.append(f"{recipient}: {str(e)}")
+                    logger.error(f"Exception sending attachment {attachment_id} to {recipient}: {e}")
+        finally:
+            if server:
+                try:
+                    server.quit()
+                    logger.info("[SMTP] Connection closed")
+                except Exception:
+                    pass
         
         # Update attachment status if at least one email was sent successfully
         if sent_to:
             attachment.status = 'sent'
             attachment.sent_to_email = ', '.join(sent_to)
-            attachment.sent_at = datetime.utcnow()
+            attachment.sent_at = datetime.now(timezone.utc)
+            attachment.original_message_id = message_id
             db.commit()
             
             return {
@@ -343,29 +393,22 @@ def send_pdf_attachment(self, attachment_id: str):
                 'failed': failed_to if failed_to else None
             }
         else:
-            # All sends failed
             error_msg = '; '.join(failed_to) if failed_to else 'All sends failed'
             logger.error(f"Failed to send attachment {attachment_id} to all recipients: {error_msg}")
             
-            # Mark as rejected after max retries
             if self.request.retries >= self.max_retries:
                 attachment.status = 'rejected'
                 attachment.reject_reason = 'send_error'
                 db.commit()
             
-            # Retry with exponential backoff
             if self.request.retries < self.max_retries:
                 raise self.retry(countdown=60 * (2 ** self.request.retries))
             
-            return {
-                'status': 'error',
-                'message': error_msg
-            }
+            return {'status': 'error', 'message': error_msg}
         
     except Exception as e:
         logger.error(f"Error sending attachment {attachment_id}: {e}")
         
-        # Update attachment status
         attachment = db.query(Attachment).filter(Attachment.id == attachment_id).first()
         if attachment:
             if self.request.retries >= self.max_retries:
@@ -373,7 +416,6 @@ def send_pdf_attachment(self, attachment_id: str):
                 attachment.reject_reason = 'send_error'
                 db.commit()
         
-        # Retry with exponential backoff
         if self.request.retries < self.max_retries:
             raise self.retry(countdown=60 * (2 ** self.request.retries))
         

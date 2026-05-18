@@ -2,7 +2,7 @@ from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, B
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from sqlalchemy.dialects.postgresql import UUID, JSONB
-from datetime import datetime
+from datetime import datetime, timezone
 import uuid
 
 Base = declarative_base()
@@ -11,14 +11,16 @@ class Object(Base):
     __tablename__ = "objects"
     
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    eldis_id = Column(String(50), index=True)  # ID из Элдис
     name = Column(String(255), nullable=False)
     name_norm = Column(String(255), nullable=False, unique=True)
     calculator_number = Column(String(50), unique=True, index=True)
     address = Column(String(255))
     email = Column(String(255))
     is_active = Column(Boolean, default=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+    object_date = Column(String(20), nullable=True)  # Период отчёта (например "23-24")
     
     attachments = relationship("Attachment", back_populates="object")
     
@@ -35,8 +37,8 @@ class EmailSource(Base):
     email = Column(String(255), nullable=False, unique=True)
     name = Column(String(255))
     is_active = Column(Boolean, default=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
     
     messages = relationship("IncomingMessage", back_populates="source")
     
@@ -56,7 +58,7 @@ class IncomingMessage(Base):
     parsed_address = Column(String(255))
     status = Column(String(50), default="new")  # new, processing, done, failed
     error_message = Column(Text)
-    received_at = Column(DateTime, default=datetime.utcnow)
+    received_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     processed_at = Column(DateTime)
     
     source = relationship("EmailSource", back_populates="messages")
@@ -76,18 +78,22 @@ class Attachment(Base):
     message_id = Column(UUID(as_uuid=True), ForeignKey("incoming_messages.id"), nullable=False)
     object_id = Column(UUID(as_uuid=True), ForeignKey("objects.id"))
     filename = Column(String(255), nullable=False)
+    sent_filename = Column(String(255))
     file_path = Column(String(500))
     file_sha256 = Column(String(64), nullable=False, unique=True)
     file_size = Column(Integer)
     calculator_number = Column(String(50), index=True)
-    status = Column(String(50), default="new")  # new, processing, validated, sent, rejected
-    reject_reason = Column(String(100))  # subject_parse, dates, tables, no_recipient, send_error, other
+    status = Column(String(50), default="new")
+    reject_reason = Column(String(100))
     validation_result = Column(JSONB)
     gpt_response = Column(JSONB)
     sent_to_email = Column(String(255))
     sent_at = Column(DateTime)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    read_receipt_received = Column(Boolean, default=False)
+    read_receipt_at = Column(DateTime)
+    original_message_id = Column(String(255))
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
     
     message = relationship("IncomingMessage", back_populates="attachments")
     object = relationship("Object", back_populates="attachments")
@@ -107,10 +113,52 @@ class Report(Base):
     attachment_id = Column(UUID(as_uuid=True), ForeignKey("attachments.id"))
     report_type = Column(String(50))  # rejection, processing_error
     details = Column(JSONB)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     
     __table_args__ = (
         Index('idx_reports_type', 'report_type'),
         Index('idx_reports_attachment', 'attachment_id'),
         Index('idx_reports_created', 'created_at'),
     )
+
+
+class User(Base):
+    __tablename__ = "users"
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    username = Column(String(50), nullable=False, unique=True)
+    password_hash = Column(String(255), nullable=False)
+    email = Column(String(255))
+    role = Column(String(20), default="operator")  # admin, operator
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+    
+    __table_args__ = (
+        Index('idx_users_username', 'username'),
+        Index('idx_users_active', 'is_active'),
+    )
+
+
+class TrustedEmail(Base):
+    __tablename__ = "trusted_emails"
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    email = Column(String(255), nullable=False, unique=True)
+    description = Column(String(255))
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    
+    __table_args__ = (
+        Index('idx_trusted_emails_active', 'is_active'),
+    )
+
+
+class Setting(Base):
+    __tablename__ = "settings"
+    
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    key = Column(String(100), nullable=False, unique=True)
+    value = Column(Text)
+    description = Column(String(255))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))

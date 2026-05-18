@@ -2,7 +2,7 @@ import os
 import pdfplumber
 # import camelot  # отключен из-за OpenCV зависимостей
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
 import json
 from celery_app import celery_app, UPLOAD_DIR
@@ -55,27 +55,43 @@ class PDFValidator:
     def extract_calculator_number(text: str) -> Optional[str]:
         """Извлечь номер вычислителя (теплосчетчика) из текста PDF"""
         try:
-            patterns = [
+            # Приоритетные паттерны - ищем по ключевым словам
+            priority_patterns = [
                 # "Прибор: ТВ7 Заводской номер: 15017757" или "Прибор: ВКТ-7 Заводской номер: 37362"
-                r'(?:Прибор|Теплосчетчик)[^\n]*?(?:Заводской номер|номер)[:\s]+(\d+)',
-                # "Теплосчетчик МКТС: №009680-1" или просто "№123456"
-                r'№\s*(\d+(?:[-–]\d+)?)',
-                # "Номер прибора: 1212725"
-                r'Номер прибора[:\s]+(\d+)',
-                # "идентификатор ИД=62434"
-                r'ИД[=:]\s*(\d+)',
-                # "Сетевой номер NT=12345"
-                r'NT[=:]\s*(\d+)',
-                # Дополнительный паттерн для номеров после слова "Прибор" или "Теплосчетчик"
-                r'(?:Прибор|Теплосчетчик)[^\n]{0,50}(?:№|номер|N)[:\s]*(\d+(?:[-–]\d+)?)',
+                r'Прибор[:\s]*(?:ТВ[78]|ВКТ-[789]|СПТ94[23])[^\n]*?Заводской\s*номер[=:]\s*(\d{4,})',
+                # "Заводской номер: 15017757" - standalone (after other context)
+                r'Заводской\s*номер[=:]\s*(\d{5,})',
+                # "Прибор: СПТ942 Заводской номер: 7590" (short number)
+                r'Прибор[:\s]*СПТ94\d[^\n]*?Заводской\s*номер[=:]\s*(\d+)',
             ]
             
-            for pattern in patterns:
+            # Проверяем приоритетные паттерны
+            for pattern in priority_patterns:
                 match = re.search(pattern, text, re.IGNORECASE)
                 if match:
                     number = match.group(1).strip()
-                    if number:
-                        logger.info(f"Found calculator number: {number}")
+                    if len(number) >= 4:
+                        logger.info(f"Found calculator number (priority): {number}")
+                        return number
+            
+            # Резервные паттерны - для сложных форматов
+            fallback_patterns = [
+                # "Тепловычислитель ВКТ-7 сет. N 61"
+                r'Тепловычислитель\s+ВКТ-[789]\s+(?:сет\.?\s*)?N[=:]\s*(\d+)',
+                # "Теплосчетчик МКТС: №005545-1"
+                r'Теплосчетчик\s+МКТС[:\s]№\s*([\d-]+)',
+                # "ТСРВ-026М №1318455" - with possible parentheses like ТСРВ-033(034)
+                r'ТСРВ[-\s]\w+(?:\(\w+\))?\s*№\s*(\d{4,})',
+                # "Сетевой номер NT=12345"
+                r'Сетевой\s*номер\s+NT[=:]\s*(\d{4,})',
+            ]
+            
+            for pattern in fallback_patterns:
+                match = re.search(pattern, text, re.IGNORECASE)
+                if match:
+                    number = match.group(1).strip()
+                    if number and len(number) >= 4:
+                        logger.info(f"Found calculator number (fallback): {number}")
                         return number
             
             logger.debug("No calculator number found in text")
@@ -211,10 +227,11 @@ class PDFValidator:
                                     continue
                                 
                                 cell_str = str(cell).strip() if cell else ''
-                                if cell_str == '---':
+                                # Check for empty cells: "---" or "нд"
+                                if cell_str == '---' or cell_str.lower() == 'нд':
                                     table_has_empty = True
                                     empty_cells_count += 1
-                                    errors.append(f"Table {table_idx + 1}, row {row_idx + 1}, col {cell_idx + 1}: ---")
+                                    errors.append(f"Table {table_idx + 1}, row {row_idx + 1}, col {cell_idx + 1}: {cell_str}")
                     
                     if not table_has_empty:
                         valid_tables += 1
@@ -314,6 +331,15 @@ def validate_pdf_attachment(self, attachment_id: str):
         if calculator_number:
             attachment.calculator_number = calculator_number
             logger.info(f"Attachment {attachment_id} has calculator number: {calculator_number}")
+            
+            # Find object by calculator number and link it
+            obj = db.query(ObjectModel).filter(
+                ObjectModel.calculator_number == calculator_number,
+                ObjectModel.is_active == True
+            ).first()
+            if obj:
+                attachment.object_id = obj.id
+                logger.info(f"Attachment {attachment_id} linked to object {obj.name} (calculator: {calculator_number})")
         
         # Update message with object info if extracted from PDF
         object_name = validation_result.get('object_name')
