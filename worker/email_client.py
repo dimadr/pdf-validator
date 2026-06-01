@@ -200,7 +200,7 @@ def is_allowed_sender(from_email: str) -> bool:
             from_email = from_email.split('<')[1].split('>')[0]
         
         from_email = from_email.strip()
-        return from_email == 'noreply@example.com'
+        return from_email == 'noreply@eldis24.ru'
     
     except Exception as e:
         logger.error(f"Error checking sender: {e}")
@@ -354,14 +354,14 @@ def fetch_emails_task(self):
                     logger.info(f"Sender {msg_data['from_email']} not allowed")
                     continue
                 
-                # Get source_id for noreply@example.com
+                # Get source_id for noreply@eldis24.ru
                 source = db.query(EmailSource).filter(
-                    EmailSource.email == 'noreply@example.com',
+                    EmailSource.email == 'noreply@eldis24.ru',
                     EmailSource.is_active == True
                 ).first()
                 
                 if not source:
-                    logger.error("Email source noreply@example.com not found")
+                    logger.error("Email source noreply@eldis24.ru not found")
                     continue
                 
                 # Parse subject

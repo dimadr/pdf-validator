@@ -16,6 +16,7 @@ celery_app = Celery(
         "pdf_validator",
         "email_sender",
         "maintenance",
+        "recovery",
     ]
 )
 
@@ -40,6 +41,10 @@ celery_app.conf.update(
             "task": "maintenance.health_check",
             "schedule": 3600.0,  # 1 hour
         },
+        "recover-stuck-attachments-every-10-minutes": {
+            "task": "recovery.recover_stuck_attachments",
+            "schedule": 600.0,  # 10 minutes
+        },
     },
 )
 
@@ -57,25 +62,17 @@ SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 
-# AI/ML Provider Configuration (NeuroAPI - existing)
+# AI/ML Provider Configuration
 AI_API_KEY = os.getenv("AI_API_KEY")
 AI_MODEL = os.getenv("AI_MODEL", "gemini-2.5-flash")
-AI_BASE_URL = os.getenv("AI_BASE_URL", "https://neuroapi.host/v1")
-
-# RouterAI Configuration (alternative AI provider)
-ROUTERAI_API_KEY = os.getenv("ROUTERAI_API_KEY")
-ROUTERAI_BASE_URL = os.getenv("ROUTERAI_BASE_URL", "https://routerai.ru/api/v1")
-
-# Available RouterAI models
-ROUTERAI_MODELS = {
-    "glm-4.7": "glm-4.7",
-    "gpt-5.3": "gpt-5.3",
-    "kimi-k2.6": "moonshotai/kimi-k2.6",
-    "claude-opus-4.7": "anthropic/claude-opus-4.7",
-}
+AI_BASE_URL = os.getenv("AI_BASE_URL")
 
 # Backward compatibility
 OPENAI_API_KEY = AI_API_KEY
+
+# Admin notification email (fallback recipients)
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "admin@example.com")
+NOTIFY_EMAIL = os.getenv("NOTIFY_EMAIL", "admin2@example.com")
 
 # Storage
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "./uploads")
