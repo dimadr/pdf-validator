@@ -5,5 +5,6 @@ from pdf_validator import validate_pdf_attachment
 from email_sender import send_pdf_attachment
 
 from maintenance import cleanup_old_files, health_check
+from recovery import recover_stuck_attachments
 
 # All tasks are now registered

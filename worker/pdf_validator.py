@@ -6,7 +6,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
 import json
 from celery_app import celery_app, UPLOAD_DIR
-from database import SessionLocal
+from database import SessionLocal, get_db
 from utils import logger
 from models import Attachment as AttachmentModel, Object as ObjectModel
 
@@ -84,6 +84,8 @@ class PDFValidator:
                 r'ТСРВ[-\s]\w+(?:\(\w+\))?\s*№\s*(\d{4,})',
                 # "Сетевой номер NT=12345"
                 r'Сетевой\s*номер\s+NT[=:]\s*(\d{4,})',
+                # "Номер прибора: 1111250" (в адресном поле)
+                r'Номер\s*прибора[=:]\s*(\d{4,})',
             ]
             
             for pattern in fallback_patterns:
@@ -195,20 +197,36 @@ class PDFValidator:
             }
 
     @staticmethod
+    def _is_empty_cell(cell) -> bool:
+        """Проверить, является ли ячейка пустой (None, пустая строка, тире, нд)"""
+        if cell is None:
+            return True
+        cell_str = str(cell).strip()
+        if not cell_str:
+            return True
+        if cell_str.lower() in ('---', 'нд', '-', '–', '—'):
+            return True
+        return False
+
+    @staticmethod
     def validate_tables(tables: List) -> Dict:
-        """Проверить таблицы - только строки начинающиеся с даты"""
+        """Проверить таблицы - строки с датой, пустые ячейки, непрерывность дат"""
         try:
             if not tables:
                 return {
                     'tables_found': 0,
                     'valid_tables': 0,
                     'tables_ok': False,
-                    'errors': ['No tables found']
+                    'empty_cells_count': 0,
+                    'errors': ['No tables found'],
+                    'table_dates': [],
+                    'date_gaps': []
                 }
             
             valid_tables = 0
             errors = []
             empty_cells_count = 0
+            table_dates = []
             
             date_pattern = r'^\d{2}\.\d{2}\.\d{4}'
             
@@ -222,30 +240,57 @@ class PDFValidator:
                         first_cell = str(row[0]).strip() if row[0] else ''
                         
                         if re.match(date_pattern, first_cell):
+                            table_dates.append(first_cell)
+                            
                             for cell_idx, cell in enumerate(row):
                                 if cell_idx == len(row) - 1:
                                     continue
                                 
-                                cell_str = str(cell).strip() if cell else ''
-                                # Check for empty cells: "---" or "нд"
-                                if cell_str == '---' or cell_str.lower() == 'нд':
+                                if PDFValidator._is_empty_cell(cell):
                                     table_has_empty = True
                                     empty_cells_count += 1
-                                    errors.append(f"Table {table_idx + 1}, row {row_idx + 1}, col {cell_idx + 1}: {cell_str}")
+                                    errors.append(
+                                        f"Table {table_idx + 1}, row {row_idx + 1}, "
+                                        f"col {cell_idx + 1}: empty"
+                                    )
                     
                     if not table_has_empty:
                         valid_tables += 1
                 else:
                     errors.append(f'Table {table_idx + 1}: empty table')
             
-            tables_ok = valid_tables == len(tables) and empty_cells_count == 0
+            # Check date continuity in table rows
+            date_gaps = []
+            if len(table_dates) >= 2:
+                parsed_dates = []
+                for d in table_dates:
+                    try:
+                        parsed_dates.append(datetime.strptime(d, '%d.%m.%Y'))
+                    except ValueError:
+                        continue
+                parsed_dates = sorted(set(parsed_dates))
+                for i in range(len(parsed_dates) - 1):
+                    expected = parsed_dates[i] + timedelta(days=1)
+                    if parsed_dates[i + 1] != expected:
+                        gap_start = parsed_dates[i].strftime('%d.%m.%Y')
+                        gap_end = parsed_dates[i + 1].strftime('%d.%m.%Y')
+                        date_gaps.append(f"Gap: {gap_start} → {gap_end}")
+            
+            tables_ok = (valid_tables == len(tables)
+                         and empty_cells_count == 0
+                         and not date_gaps)
+            
+            if date_gaps:
+                errors.extend(date_gaps)
             
             return {
                 'tables_found': len(tables),
                 'valid_tables': valid_tables,
                 'tables_ok': tables_ok,
                 'empty_cells_count': empty_cells_count,
-                'errors': errors
+                'errors': errors,
+                'table_dates': sorted(set(table_dates)),
+                'date_gaps': date_gaps
             }
             
         except Exception as e:
@@ -254,7 +299,10 @@ class PDFValidator:
                 'tables_found': 0,
                 'valid_tables': 0,
                 'tables_ok': False,
-                'errors': [str(e)]
+                'empty_cells_count': 0,
+                'errors': [str(e)],
+                'table_dates': [],
+                'date_gaps': []
             }
 
     @staticmethod
@@ -354,14 +402,24 @@ def validate_pdf_attachment(self, attachment_id: str):
         # Update attachment status based on validation
         dates_ok = validation_result['dates']['dates_ok']
         
+        # Add deterministic keys for GPT pipeline compatibility
+        validation_result['deterministic_dates_ok'] = dates_ok
+        validation_result['deterministic_tables_ok'] = tables_ok
+        
         if dates_ok and tables_ok:
             # Все поля заполнены
             attachment.status = 'approved'
             attachment.reject_reason = None
             attachment.validation_result = validation_result
             logger.info(f"Attachment {attachment_id} approved - all fields filled")
+            
+            db.commit()
+            
+            # Queue final validation decision (deterministic only)
+            finalize_validation.delay(attachment_id)
+            logger.info(f"Queued attachment {attachment_id} for final validation")
         else:
-            # Есть пустые ячейки
+            # Есть пустые ячейки — сразу rejected, GPT не нужен
             attachment.status = 'rejected'
             
             reasons = []
@@ -373,14 +431,13 @@ def validate_pdf_attachment(self, attachment_id: str):
             attachment.reject_reason = ';'.join(reasons)
             attachment.validation_result = validation_result
             logger.warning(f"Attachment {attachment_id} rejected: {reasons}")
-        
-        db.commit()
-        
-        # Queue for sending
-        if attachment.status in ['approved', 'rejected']:
+            
+            db.commit()
+            
+            # Queue directly for sending to admin
             from email_sender import send_pdf_attachment
             send_pdf_attachment.delay(attachment_id)
-            logger.info(f"Queued attachment {attachment_id} for sending")
+            logger.info(f"Queued rejected attachment {attachment_id} for sending to admin")
         
         return {
             'status': 'success',
@@ -404,41 +461,69 @@ def validate_pdf_attachment(self, attachment_id: str):
     finally:
         db.close()
 
-@celery_app.task(bind=True, max_retries=3)
-def validate_with_gpt(self, attachment_id: str):
-    """GPT валидация PDF"""
-    logger.info(f"Starting GPT validation for attachment {attachment_id}")
-    
-    db = SessionLocal()
-    try:
-        # Get attachment from DB
-        attachment = db.query(AttachmentModel).filter(AttachmentModel.id == attachment_id).first()
-        if not attachment:
-            logger.error(f"Attachment {attachment_id} not found")
-            return {'status': 'error', 'message': 'Attachment not found'}
-        
-        # Здесь можно добавить логику GPT валидации
-        # Пока просто одобряем
-        attachment.status = 'approved'
-        db.commit()
-        
-        logger.info(f"GPT validation completed for attachment {attachment_id}")
-        return {'status': 'success', 'approved': True}
-        
-    except Exception as e:
-        logger.error(f"Error in GPT validation for attachment {attachment_id}: {e}")
-        
-        # Update attachment status
-        attachment = db.query(AttachmentModel).filter(AttachmentModel.id == attachment_id).first()
-        if attachment:
-            attachment.status = 'rejected'
-            attachment.reject_reason = 'gpt_validation_error'
+
+@celery_app.task
+def finalize_validation(attachment_id: str):
+    """Финализация валидации и принятие решения (детерминированная)"""
+    logger.info(f"Finalizing validation for attachment {attachment_id}")
+
+    with get_db() as db:
+        try:
+            attachment = db.query(AttachmentModel).filter(AttachmentModel.id == attachment_id).first()
+            if not attachment:
+                logger.error(f"Attachment {attachment_id} not found")
+                return {'status': 'error', 'message': 'Attachment not found'}
+
+            validation_result = attachment.validation_result or {}
+
+            deterministic_dates_ok = validation_result.get('deterministic_dates_ok', False)
+            deterministic_tables_ok = validation_result.get('deterministic_tables_ok', False)
+
+            final_valid = deterministic_dates_ok and deterministic_tables_ok
+            final_dates_ok = deterministic_dates_ok
+            final_tables_ok = deterministic_tables_ok
+            reason = 'validated' if final_valid else 'deterministic_validation'
+
+            validation_result['final_dates_ok'] = final_dates_ok
+            validation_result['final_tables_ok'] = final_tables_ok
+            validation_result['final_valid'] = final_valid
+            validation_result['final_reason'] = reason
+
+            attachment.validation_result = validation_result
+
+            if final_valid:
+                attachment.status = 'validated'
+            else:
+                attachment.status = 'rejected'
+                if not final_dates_ok:
+                    attachment.reject_reason = 'dates'
+                elif not final_tables_ok:
+                    attachment.reject_reason = 'tables'
+                else:
+                    attachment.reject_reason = 'validation'
+
             db.commit()
-        
-        # Retry with exponential backoff
-        if self.request.retries < self.max_retries:
-            raise self.retry(countdown=60 * (2 ** self.request.retries))
-        
-        return {'status': 'error', 'message': str(e)}
-    finally:
-        db.close()
+
+            from email_sender import send_pdf_attachment
+            send_pdf_attachment.delay(attachment_id)
+
+            logger.info(f"Validation finalized for attachment {attachment_id}: {attachment.status}")
+
+            return {
+                'status': 'success',
+                'final_valid': final_valid,
+                'attachment_status': attachment.status,
+                'reason': reason
+            }
+
+        except Exception as e:
+            logger.error(f"Error finalizing validation for attachment {attachment_id}: {e}")
+
+            attachment = db.query(AttachmentModel).filter(AttachmentModel.id == attachment_id).first()
+            if attachment:
+                attachment.status = 'rejected'
+                attachment.reject_reason = 'validation_error'
+                db.commit()
+
+            return {'status': 'error', 'message': str(e)}
+

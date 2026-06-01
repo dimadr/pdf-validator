@@ -16,7 +16,7 @@ import sys
 # Add parent directory to path for imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from celery_app import celery_app, SMTP_SERVER, SMTP_PORT, SMTP_USER, SMTP_PASSWORD
+from celery_app import celery_app, SMTP_SERVER, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, ADMIN_EMAIL, NOTIFY_EMAIL
 from utils import logger
 from database import SessionLocal
 from models import Attachment, Object
@@ -207,22 +207,16 @@ class EmailSender:
         subject: str,
         body: str,
         pdf_path: str,
-        pdf_filename: str,
-        server=None
+        pdf_filename: str
     ) -> Dict:
-        """Отправить email с PDF вложением.
-        Если server передан — использует существующее SMTP-соединение.
-        """
+        """Отправить email с PDF вложением (отдельное SMTP-соединение на каждый вызов)"""
         logger.info(f"[EMAIL] Starting send_email_with_pdf to {to_email}")
-        own_connection = False
-        
+        server = None
         try:
             message = self._build_message(to_email, subject, body, pdf_path, pdf_filename)
             message_id = message["Message-ID"]
             
-            if server is None:
-                server = self._connect_smtp()
-                own_connection = True
+            server = self._connect_smtp()
             
             text = message.as_string()
             logger.info(f"[SMTP] Sending email to {to_email}...")
@@ -235,7 +229,7 @@ class EmailSender:
             logger.error(f"Error sending email to {to_email}: {e}")
             return {"status": "error", "message": str(e)}
         finally:
-            if own_connection and server:
+            if server:
                 try:
                     server.quit()
                     logger.info("[SMTP] Connection closed")
@@ -257,15 +251,57 @@ def send_pdf_attachment(self, attachment_id: str):
             logger.error(f"Attachment {attachment_id} not found")
             return {'status': 'error', 'message': 'Attachment not found'}
         
-        if attachment.status not in ['approved', 'rejected']:
+        if attachment.status not in ['approved', 'rejected', 'validated']:
             logger.error(f"Attachment {attachment_id} cannot be sent (status: {attachment.status})")
             return {'status': 'error', 'message': f'Attachment status is {attachment.status}, cannot send'}
+        
+        # Check if linked object is inactive — skip sending entirely
+        inactive_obj = None
+        if attachment.calculator_number:
+            inactive_obj = db.query(Object).filter(
+                Object.calculator_number == attachment.calculator_number,
+                Object.is_active == False
+            ).first()
+        if not inactive_obj and attachment.object_id:
+            inactive_obj = db.query(Object).filter(
+                Object.id == attachment.object_id,
+                Object.is_active == False
+            ).first()
+        # Name-based fallback only when calculator_number is missing
+        # (number/id checks above already cover known calculator_number)
+        if not inactive_obj and not attachment.calculator_number:
+            names_to_check = []
+            if attachment.message and attachment.message.parsed_object:
+                names_to_check.append(attachment.message.parsed_object)
+            if attachment.validation_result and attachment.validation_result.get('object_name'):
+                names_to_check.append(attachment.validation_result['object_name'])
+            for raw_name in names_to_check:
+                name_clean = re.split(r'\s+[Аа]дрес[:\s]|\s+[Уу]л[\.\s]|\s+[Гг][\.\s]', raw_name)[0].strip()
+                if name_clean and len(name_clean) >= 5:
+                    inactive_obj = db.query(Object).filter(
+                        Object.name.ilike(f"%{name_clean}%"),
+                        Object.is_active == False
+                    ).first()
+                    if inactive_obj:
+                        break
+        if inactive_obj:
+            logger.info(f"Attachment {attachment_id} skipped: object {inactive_obj.name} is inactive")
+            return {'status': 'skipped', 'reason': 'object_inactive'}
+        
+        # Safety: if status says approved but reject_reason is set, treat as rejected
+        if attachment.reject_reason and attachment.status in ('approved', 'validated'):
+            logger.warning(
+                f"Attachment {attachment_id} has status={attachment.status} "
+                f"but reject_reason='{attachment.reject_reason}', treating as rejected"
+            )
+            attachment.status = 'rejected'
+            db.commit()
         
         # Determine recipients based on status
         recipients = []
         obj = None
         
-        if attachment.status == 'approved':
+        if attachment.status in ('approved', 'validated'):
             if attachment.calculator_number:
                 obj = sender._find_object_for_attachment(db, attachment)
                 
@@ -275,11 +311,11 @@ def send_pdf_attachment(self, attachment_id: str):
                     logger.info(f"Attachment {attachment_id} approved, found object {obj.name}, sending to {email_list}")
             
             if not recipients:
-                recipients = ['admin@example.com']
-                logger.warning(f"Attachment {attachment_id} approved, object not found or no email, sending to admin")
+                recipients = [ADMIN_EMAIL]
+                logger.warning(f"Attachment {attachment_id} approved, object not found or no email, sending to {ADMIN_EMAIL}")
         else:
-            recipients = ['admin@example.com']
-            logger.info(f"Attachment {attachment_id} rejected, sending to admin: admin@example.com")
+            recipients = [ADMIN_EMAIL]
+            logger.info(f"Attachment {attachment_id} rejected, sending to admin: {ADMIN_EMAIL}")
         
         # Get object name and address (reuse found object or fallback to message)
         if obj:
@@ -305,15 +341,44 @@ def send_pdf_attachment(self, attachment_id: str):
                 tables_result = attachment.validation_result['tables']
                 empty_cells_info = tables_result.get('errors', [])
             
-            subject = f"⚠️ ВНИМАНИЕ: Пропуски в данных - {object_name}"
+            # Parse reject_reason into human-readable text
+            reject_parts = []
+            if attachment.reject_reason:
+                for part in attachment.reject_reason.split(';'):
+                    part = part.strip()
+                    if part.startswith('empty_cells:'):
+                        count = part.split(':', 1)[1]
+                        reject_parts.append(f"• Пустые ячейки: {count} шт.")
+                    elif part == 'dates_invalid':
+                        reject_parts.append("• Нет валидных дат в документе")
+                    elif part == 'validation_error':
+                        reject_parts.append("• Ошибка при обработке PDF")
+                    elif part == 'file_not_found':
+                        reject_parts.append("• Файл PDF не найден")
+                    elif part:
+                        reject_parts.append(f"• {part}")
+            
+            reason_text = '\n'.join(reject_parts) if reject_parts else ''
+            
+            # Build subject based on reason
+            if 'empty_cells' in (attachment.reject_reason or ''):
+                subject = f"⚠️ ВНИМАНИЕ: Пропуски в данных - {object_name}"
+            elif 'dates_invalid' in (attachment.reject_reason or ''):
+                subject = f"⚠️ ОШИБКА: Нет дат в документе - {object_name}"
+            else:
+                subject = f"⚠️ ОШИБКА: {object_name}"
+            
             body = f"""Здравствуйте!
 
 Во вложении находится документ по объекту: {object_name}
 Адрес: {address}
 
-⚠️ ВНИМАНИЕ: В документе обнаружены пропуски в данных!
+⚠️ ВНИМАНИЕ: В документе обнаружены проблемы!
 
-Проблемы ({len(empty_cells_info)}):
+Причина:
+{reason_text}
+
+Подробности ({len(empty_cells_info)}):
 {chr(10).join(empty_cells_info[:10])}{'...' if len(empty_cells_info) > 10 else ''}
 
 Дата получения: {datetime.now(MOSCOW_TZ).strftime('%d.%m.%Y %H:%M')}
@@ -325,7 +390,7 @@ def send_pdf_attachment(self, attachment_id: str):
             body = f"""Здравствуйте!
 
 Мы запускаем автоматическую рассылку отчётов. Если вы обнаружили какие‑либо неточности в отчёте, пожалуйста, сообщите об этом:
-    по электронной почте: admin@example.com
+    по электронной почте: {ADMIN_EMAIL}
     или по телефону: +7 902 318-86-89 Дмитрий.
 
 Во вложении находится отчет:
@@ -336,51 +401,40 @@ def send_pdf_attachment(self, attachment_id: str):
 ---
 Это автоматическое сообщение, пожалуйста, не отвечайте на него."""
         
-        # Add admin2@example.com for rejected attachments
-        if attachment.status == 'rejected' and 'admin2@example.com' not in recipients:
-            recipients.append('admin2@example.com')
+        # Add NOTIFY_EMAIL for rejected attachments
+        if attachment.status == 'rejected' and NOTIFY_EMAIL not in recipients:
+            recipients.append(NOTIFY_EMAIL)
         
-        # Send to all recipients using single SMTP connection
+        # Send to each recipient with its own SMTP connection
         sent_to = []
         failed_to = []
         message_id = None
-        server = None
         
-        try:
-            server = sender._connect_smtp()
-            
-            for recipient in recipients:
-                try:
-                    result = sender.send_email_with_pdf(
-                        to_email=recipient,
-                        subject=subject,
-                        body=body.strip(),
-                        pdf_path=attachment.file_path,
-                        pdf_filename=safe_filename,
-                        server=server
-                    )
-                    
-                    if result['status'] == 'success':
-                        sent_to.append(recipient)
-                        message_id = result.get('message_id')
-                        logger.info(f"Attachment {attachment_id} sent successfully to {recipient}")
-                    else:
-                        failed_to.append(f"{recipient}: {result.get('message', 'unknown error')}")
-                        logger.error(f"Failed to send attachment {attachment_id} to {recipient}: {result.get('message')}")
-                except Exception as e:
-                    failed_to.append(f"{recipient}: {str(e)}")
-                    logger.error(f"Exception sending attachment {attachment_id} to {recipient}: {e}")
-        finally:
-            if server:
-                try:
-                    server.quit()
-                    logger.info("[SMTP] Connection closed")
-                except Exception:
-                    pass
+        for recipient in recipients:
+            try:
+                result = sender.send_email_with_pdf(
+                    to_email=recipient,
+                    subject=subject,
+                    body=body.strip(),
+                    pdf_path=attachment.file_path,
+                    pdf_filename=safe_filename
+                )
+                
+                if result['status'] == 'success':
+                    sent_to.append(recipient)
+                    message_id = result.get('message_id')
+                    logger.info(f"Attachment {attachment_id} sent successfully to {recipient}")
+                else:
+                    failed_to.append(f"{recipient}: {result.get('message', 'unknown error')}")
+                    logger.error(f"Failed to send attachment {attachment_id} to {recipient}: {result.get('message')}")
+            except Exception as e:
+                failed_to.append(f"{recipient}: {str(e)}")
+                logger.error(f"Exception sending attachment {attachment_id} to {recipient}: {e}")
         
         # Update attachment status if at least one email was sent successfully
         if sent_to:
-            attachment.status = 'sent'
+            if attachment.status != 'rejected':
+                attachment.status = 'sent'
             attachment.sent_to_email = ', '.join(sent_to)
             attachment.sent_at = datetime.now(timezone.utc)
             attachment.original_message_id = message_id
