@@ -20,4 +20,7 @@ GitHub/
 SKILLS.md
 AGENTS.md
 mkcert-ca.crt
+install-ca.sh
+install-ca-windows.ps1
+ssl-setup.html
 
