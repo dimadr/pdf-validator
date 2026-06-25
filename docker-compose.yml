@@ -5,14 +5,16 @@ services:
     image: postgres:15
     container_name: project1-postgres
     restart: always
+    entrypoint: ["/postgres-entrypoint.sh"]
     environment:
       POSTGRES_DB: email_processor
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres-entrypoint.sh:/postgres-entrypoint.sh:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
@@ -40,8 +42,8 @@ services:
     ports:
       - "8001:8000"
     environment:
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/email_processor
-      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: "${DATABASE_URL}"
+      REDIS_URL: "${REDIS_URL}"
     env_file:
       - .env
     depends_on:
@@ -60,8 +62,8 @@ services:
     restart: always
     command: celery -A celery_app worker --loglevel=info
     environment:
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/email_processor
-      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: "${DATABASE_URL}"
+      REDIS_URL: "${REDIS_URL}"
     env_file:
       - .env
     depends_on:
@@ -80,8 +82,8 @@ services:
     restart: always
     command: celery -A celery_app beat --loglevel=info
     environment:
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/email_processor
-      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: "${DATABASE_URL}"
+      REDIS_URL: "${REDIS_URL}"
     env_file:
       - .env
     depends_on:
