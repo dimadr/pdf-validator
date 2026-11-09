@@ -1,0 +1,13 @@
+{
+  "name": "project1-isolated-ui-tests",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "test": "node run-ui.cjs",
+    "test:webkit": "node run-ui.cjs --webkit",
+    "capture:before": "node run-ui.cjs --before"
+  },
+  "devDependencies": {
+    "playwright": "1.62.1"
+  }
+}

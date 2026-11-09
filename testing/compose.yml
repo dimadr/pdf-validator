@@ -1,0 +1,117 @@
+name: project1-rc-acceptance
+
+x-logging: &bounded-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  postgres:
+    image: "${PROJECT1_TEST_POSTGRES_IMAGE:-postgres:15-bookworm}"
+    environment:
+      POSTGRES_USER: project1_test
+      POSTGRES_DB: project1_test
+      POSTGRES_PASSWORD: "${PROJECT1_TEST_POSTGRES_PASSWORD:?Set an isolated test password in the environment}"
+    volumes:
+      - postgres_test:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U project1_test -d project1_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    mem_limit: 512m
+    cpus: 0.5
+    pids_limit: 128
+    shm_size: 128m
+    networks: [isolated]
+    logging: *bounded-logging
+
+  redis:
+    image: redis:7-alpine
+    command: [redis-server, --appendonly, "yes", --appendfsync, always, --save, ""]
+    volumes:
+      - redis_test:/data
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    mem_limit: 128m
+    cpus: 0.25
+    pids_limit: 64
+    networks: [isolated]
+    logging: *bounded-logging
+
+  smtp:
+    image: "${PROJECT1_TEST_IMAGE_PREFIX:?Set unique test image prefix}-smtp"
+    pull_policy: never
+    build:
+      context: ..
+      dockerfile: testing/smtp/Dockerfile
+    environment:
+      SMTP_SINK_DATA: /data
+      SMTP_SINK_MAX_BYTES: "73400320"
+    volumes:
+      - smtp_test:/data
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8025/health', timeout=2)"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    mem_limit: 256m
+    cpus: 0.25
+    pids_limit: 64
+    networks: [isolated]
+    logging: *bounded-logging
+
+  test-runner:
+    image: "${PROJECT1_TEST_IMAGE_PREFIX:?Set unique test image prefix}-test-runner"
+    pull_policy: never
+    build:
+      context: ..
+      dockerfile: testing/Dockerfile
+    environment:
+      DATABASE_URL: "postgresql+psycopg2://project1_test:${PROJECT1_TEST_POSTGRES_PASSWORD:?Set an isolated test password}@postgres:5432/project1_test"
+      TEST_DATABASE_URL: "postgresql+psycopg2://project1_test:${PROJECT1_TEST_POSTGRES_PASSWORD:?Set an isolated test password}@postgres:5432/project1_test"
+      REDIS_URL: redis://redis:6379/0
+      TEST_REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: "${PROJECT1_TEST_JWT_SECRET:?Generate isolated test JWT secret}"
+      PIPELINE_V2_ENABLED: "true"
+      SMTP_TEST_MODE: "true"
+      SMTP_SERVER: smtp
+      SMTP_PORT: "1025"
+      SMTP_FROM: processor@example.invalid
+      SMTP_USER: ""
+      SMTP_PASSWORD: ""
+      SMTP_SINK_URL: http://smtp:8025
+      ADMIN_EMAIL: admin@example.invalid
+      NOTIFY_EMAIL: notify@example.invalid
+      UPLOAD_DIR: /tmp/project1-uploads
+      PROJECT1_TEST_SCOPE: isolated-compose
+      TEST_ARTIFACT_DIR: /results
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      smtp: {condition: service_healthy}
+    read_only: true
+    volumes:
+      - results_test:/results
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 1536m
+    cpus: 1.0
+    pids_limit: 256
+    networks: [isolated]
+    logging: *bounded-logging
+
+volumes:
+  results_test:
+  postgres_test:
+  redis_test:
+  smtp_test:
+networks:
+  isolated:
+    internal: true

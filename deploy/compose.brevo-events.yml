@@ -1,0 +1,11 @@
+services:
+  worker:
+    environment:
+      BREVO_API_KEY_FILE: /run/secrets/brevo_api_key
+    volumes:
+      - type: bind
+        source: /root/project1-next/deploy/secrets/brevo-api-key
+        target: /run/secrets/brevo_api_key
+        read_only: true
+        bind:
+          create_host_path: false

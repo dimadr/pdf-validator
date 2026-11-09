@@ -1,0 +1,545 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Email Processor Admin</title>
+    <link rel="icon" type="image/svg+xml" href="favicon.svg">
+    <link href="vendor/bootstrap.min.css" rel="stylesheet">
+    <link href="vendor/bootstrap-icons.css" rel="stylesheet">
+    <link rel="stylesheet" href="vendor/inter/inter.css">
+    <link rel="stylesheet" href="admin.css?v=mail-archive-20261105">
+</head>
+<body>
+    <a class="skip-link" href="#main-content">К содержимому</a>
+    <nav class="navbar navbar-expand-lg app-header">
+        <div class="container">
+            <a class="navbar-brand" href="#">
+                <span class="brand-mark"><i class="bi bi-envelope-check" aria-hidden="true"></i></span> Email Processor <span class="version-label">V2</span>
+            </a>
+            <div class="navbar-nav ms-auto">
+                <span class="navbar-text" id="connection-status">
+                    <i class="bi bi-circle-fill text-warning"></i> Подключение...
+                </span>
+                <span class="navbar-text ms-3" id="user-info" style="display: none;">
+                    <i class="bi bi-person"></i> <span id="username"></span>
+                </span>
+                <button class="btn btn-outline-light btn-sm ms-3" id="logout-btn" style="display: none;">
+                    <i class="bi bi-box-arrow-right"></i> Выйти
+                </button>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container" id="main-content">
+        <div id="notifications" aria-live="polite"></div>
+        <div class="page-heading"><h1>Обработка почты</h1><p>PDF-документы, объекты и результаты отправки</p></div>
+        <section class="summary-grid" aria-label="Статистика документов">
+            <div class="summary-card"><h5>Всего вложений</h5><h2 id="total-attachments">—</h2></div>
+            <div class="summary-card"><h5>Обработано</h5><h2 id="processed-attachments">—</h2></div>
+            <div class="summary-card"><h5>Отклонено</h5><h2 id="rejected-attachments">—</h2></div>
+            <div class="summary-card"><h5 title="Документы: все клиентские адресаты текущего намерения приняты SMTP">Принято SMTP</h5><h2 id="sent-attachments">—</h2><small>Исторические отметки sent: <span id="legacy-sent-attachments">—</span></small></div>
+        </section>
+
+        <div id="pipeline-alerts" class="alert alert-secondary" role="status">Загрузка состояния pipeline</div>
+        <!-- Навигация по разделам -->
+        <ul class="nav nav-tabs" id="mainTabs" role="tablist">
+            <li class="nav-item" role="presentation">
+                <button class="nav-link active" id="objects-tab" data-bs-toggle="tab" data-bs-target="#objects" type="button" role="tab">
+                    <i class="bi bi-building"></i> Объекты
+                </button>
+            </li>
+            <li class="nav-item" role="presentation">
+                <button class="nav-link" id="email-sources-tab" data-bs-toggle="tab" data-bs-target="#email-sources" type="button" role="tab">
+                    <i class="bi bi-envelope"></i> Email источники
+                </button>
+            </li>
+            <li class="nav-item" role="presentation">
+                <button class="nav-link" id="documents-tab" data-bs-toggle="tab" data-bs-target="#documents" type="button" role="tab">
+                    <i class="bi bi-file-earmark-pdf"></i> Документы
+                </button>
+            </li>
+            <li class="nav-item" role="presentation">
+                <button class="nav-link" id="reports-tab" data-bs-toggle="tab" data-bs-target="#reports" type="button" role="tab">
+                    <i class="bi bi-graph-up"></i> Отчёты
+                </button>
+            </li>
+            <li class="nav-item" role="presentation">
+                <button class="nav-link" id="settings-tab" data-bs-toggle="tab" data-bs-target="#settings" type="button" role="tab">
+                    <i class="bi bi-gear"></i> Настройки
+                </button>
+            </li>
+        </ul>
+
+        <div class="tab-content mt-3" id="mainTabsContent">
+            <!-- Объекты -->
+            <div class="tab-pane fade show active" id="objects" role="tabpanel">
+                <div class="section-heading">
+                    <h4>Объекты</h4>
+                    <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#objectModal">
+                        <i class="bi bi-plus"></i> Добавить объект
+                    </button>
+                </div>
+                <div class="filter-bar" role="search" aria-label="Поиск и фильтры объектов">
+                        <input type="search" class="form-control search-field" id="search-objects" placeholder="Найти объект" aria-label="Поиск объектов">
+                        <button class="btn btn-outline-primary" onclick="admin.loadObjects()">
+                            <i class="bi bi-search"></i> Поиск
+                        </button>
+                        <input type="text" class="form-control period-field" id="period-filter" placeholder="Период" aria-label="Период отчёта">
+                        <select class="form-select sort-field" id="sort-by" aria-label="Сортировка объектов">
+                            <option value="">Сортировка</option>
+                            <option value="name">По названию</option>
+                            <option value="eldis_id">По ID</option>
+                            <option value="object_date">По периоду</option>
+                            <option value="calculator_number">По № вычислителя</option>
+                            <option value="created_at">По дате создания</option>
+                        </select>
+                        <button class="btn btn-outline-secondary" onclick="admin.loadObjects()">
+                            <i class="bi bi-filter"></i> Фильтр
+                        </button>
+                </div>
+                <div class="table-responsive">
+                    <table class="table" id="objects-table" aria-label="Объекты">
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>Период отчета</th>
+                                <th>Название</th>
+                                <th>№ вычислителя</th>
+                                <th>Адрес</th>
+                                <th>Email</th>
+                                <th>Статус</th>
+                                <th>Действия</th>
+                            </tr>
+                        </thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Email источники -->
+            <div class="tab-pane fade" id="email-sources" role="tabpanel">
+                <div class="section-heading">
+                    <h4>Разрешённые email</h4>
+                    <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#email-source-modal">
+                        <i class="bi bi-plus"></i> Добавить email
+                    </button>
+                </div>
+                <div class="table-responsive">
+                    <table class="table" id="email-sources-table" aria-label="Email источники">
+                        <thead>
+                            <tr>
+                                <th>Email</th>
+                                <th>Название</th>
+                                <th>Статус</th>
+                                <th>Действия</th>
+                            </tr>
+                        </thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Документы -->
+            <div class="tab-pane fade" id="documents" role="tabpanel">
+                <div class="section-heading"><h4>Документы</h4></div>
+                <div class="filter-bar" role="search" aria-label="Поиск и фильтры документов">
+                            <input type="text" class="form-control search-field" id="search-documents" placeholder="Найти документ" aria-label="Поиск документов">
+                            <select class="form-select status-field" id="status-filter" aria-label="Статус документа">
+                                <option value="">Все статусы</option>
+                                <option value="new">Новые</option>
+                                <option value="processing">В обработке</option>
+                                <option value="validated">Проверены</option>
+                                <option value="accepted">Проверен и отправлен</option>
+                                <option value="sent">История отметок отправки</option>
+                                <option value="rejected">Отклонены</option>
+                                <option value="review_required">Требуют проверки</option>
+                                <option value="technical_error">Техническая ошибка</option>
+                                <option value="discarded_inactive">Неактивные: без отправки</option>
+                                <option value="archived">Корзина (архив)</option>
+                            </select>
+                            <select class="form-select sort-field" id="sort-attachments" aria-label="Сортировка документов">
+                                <option value="created_at">По дате (новые)</option>
+                                <option value="sent_at">По дате отправки</option>
+                                <option value="filename">По имени</option>
+                            </select>
+                            <button class="btn btn-outline-secondary" id="refresh-documents" aria-label="Обновить документы" title="Обновить документы">
+                                <i class="bi bi-arrow-clockwise"></i>
+                            </button>
+                </div>
+                <div class="table-responsive">
+                    <table class="table" id="documents-table" aria-label="Документы">
+                        <thead>
+                            <tr>
+                                <th>Файл</th>
+                                <th>№ прибора</th>
+                                <th>Объект</th>
+                                <th>Отправитель</th>
+                                <th>Статус</th>
+                                <th>Причина отказа</th>
+                                <th>Создан</th>
+                                <th>Действия</th>
+                            </tr>
+                        </thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Отчёты -->
+            <div class="tab-pane fade" id="reports" role="tabpanel">
+                <div class="section-heading">
+                    <h4>Отчёты</h4>
+                    <div class="btn-group">
+                        <button class="btn btn-outline-primary" id="refresh-reports">
+                            <i class="bi bi-arrow-clockwise"></i> Обновить
+                        </button>
+                        <a href="/api/v1/reports/rejections.csv" class="btn btn-success">
+                            <i class="bi bi-download"></i> Экспорт CSV
+                        </a>
+                    </div>
+                </div>
+                <div class="table-responsive">
+                    <table class="table" id="rejections-table" aria-label="Отчёты об отказах">
+                        <thead>
+                            <tr>
+                                <th>Файл</th>
+                                <th>Причина отказа</th>
+                                <th>Объект</th>
+                                <th>Тема письма</th>
+                                <th>Дата</th>
+                            </tr>
+                        </thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Настройки -->
+            <div class="tab-pane fade" id="settings" role="tabpanel">
+                <div class="card mb-3"><div class="card-body ai-settings"><div><h5>SMTP-провайдер</h5><p>Активный: <strong id="smtp-active-provider">Загрузка</strong></p></div><div>
+                    <label class="form-label" for="smtp-provider-select">Отправка писем</label>
+                    <select class="form-select" id="smtp-provider-select"><option value="brevo">Brevo</option><option value="timeweb">Timeweb</option></select>
+                    <button class="btn btn-sm btn-primary mt-2" type="button" id="smtp-provider-apply">Применить</button>
+                    <p id="smtp-provider-status" aria-live="polite"></p>
+                    <p class="text-muted">Переключение вручную. Уже принятые письма повторно не отправляются.</p>
+                </div></div></div>
+                <div class="card mb-3"><div class="card-body ai-settings"><div><h5>AI-анализ сложных PDF</h5><p class="text-muted">Дополнительная проверка сложных документов</p></div><div>
+                    <div class="form-check form-switch">
+                        <input class="form-check-input" type="checkbox" role="switch" id="ai-fallback-toggle">
+                        <label class="form-check-label" for="ai-fallback-toggle">Запрос AI: <strong id="ai-requested">ВЫКЛ</strong></label>
+                    </div>
+                    <p id="ai-availability" aria-live="polite">Загрузка состояния</p>
+                    <p class="text-muted">Обычная обработка работает всегда. Включение AI не перерабатывает историю и не запускает повторную рассылку.</p>
+                </div></div></div>
+                <ul class="nav nav-pills mb-3" id="settingsTabs" role="tablist">
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link active" id="users-settings-tab" data-bs-toggle="pill" data-bs-target="#users-settings" type="button">
+                            <i class="bi bi-people"></i> Пользователи
+                        </button>
+                    </li>
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link" id="trusted-tab" data-bs-toggle="pill" data-bs-target="#trusted-settings" type="button">
+                            <i class="bi bi-envelope-check"></i> Доверенные адреса
+                        </button>
+                    </li>
+                    <li class="nav-item" role="presentation">
+                        <button class="nav-link" id="email-out-tab" data-bs-toggle="pill" data-bs-target="#email-out-settings" type="button">
+                            <i class="bi bi-envelope"></i> Почта
+                        </button>
+                    </li>
+                </ul>
+
+                <div class="tab-content" id="settingsTabsContent">
+                    <!-- Пользователи -->
+                    <div class="tab-pane fade show active" id="users-settings" role="tabpanel">
+                        <div class="section-heading">
+                            <h4>Пользователи</h4>
+                            <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#userModal">
+                                <i class="bi bi-plus"></i> Добавить пользователя
+                            </button>
+                        </div>
+                        <div class="table-responsive">
+                            <table class="table" id="users-table" aria-label="Пользователи">
+                                <thead>
+                                    <tr>
+                                        <th>Имя пользователя</th>
+                                        <th>Email</th>
+                                        <th>Роль</th>
+                                        <th>Статус</th>
+                                        <th>Действия</th>
+                                    </tr>
+                                </thead>
+                                <tbody></tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    <!-- Доверенные адреса -->
+                    <div class="tab-pane fade" id="trusted-settings" role="tabpanel">
+                        <div class="section-heading">
+                            <h4>Доверенные адреса</h4>
+                            <button class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#trustedEmailModal">
+                                <i class="bi bi-plus"></i> Добавить адрес
+                            </button>
+                        </div>
+                        <div class="table-responsive">
+                            <table class="table" id="trusted-emails-table" aria-label="Доверенные адреса">
+                                <thead>
+                                    <tr>
+                                        <th>Email</th>
+                                        <th>Описание</th>
+                                        <th>Статус</th>
+                                        <th>Действия</th>
+                                    </tr>
+                                </thead>
+                                <tbody></tbody>
+                            </table>
+                        </div>
+                    </div>
+
+                    <!-- Email -->
+                    <div class="tab-pane fade" id="email-out-settings" role="tabpanel">
+                        <h4>Настройки почты</h4>
+                        <div class="card">
+                            <div class="card-body">
+                                <form id="email-config-form">
+                                    <h5 class="card-title">IMAP</h5>
+                                    <div class="row">
+                                        <div class="col-md-6 mb-3">
+                                            <label class="form-label">IMAP сервер</label>
+                                            <input type="text" class="form-control" id="imap-server" placeholder="imap.example.com">
+                                        </div>
+                                        <div class="col-md-3 mb-3">
+                                            <label class="form-label">Порт</label>
+                                            <input type="number" class="form-control" id="imap-port" placeholder="993">
+                                        </div>
+                                        <div class="col-md-3 mb-3">
+                                            <div class="form-check mt-4">
+                                                <input class="form-check-input" type="checkbox" id="imap-ssl" checked>
+                                                <label class="form-check-label" for="imap-ssl">SSL</label>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <hr>
+                                    <h5 class="card-title">SMTP</h5>
+                                    <div class="row">
+                                        <div class="col-md-6 mb-3">
+                                            <label class="form-label">SMTP сервер</label>
+                                            <input type="text" class="form-control" id="smtp-server" placeholder="smtp.example.com">
+                                        </div>
+                                        <div class="col-md-3 mb-3">
+                                            <label class="form-label">Порт</label>
+                                            <input type="number" class="form-control" id="smtp-port" placeholder="465">
+                                        </div>
+                                        <div class="col-md-3 mb-3">
+                                            <div class="form-check mt-4">
+                                                <input class="form-check-input" type="checkbox" id="smtp-ssl" checked>
+                                                <label class="form-check-label" for="smtp-ssl">SSL</label>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <hr>
+                                    <h5 class="card-title">Учетные данные</h5>
+                                    <div class="row">
+                                        <div class="col-md-6 mb-3">
+                                            <label class="form-label">Email</label>
+                                            <input type="email" class="form-control" id="email-username" placeholder="user@example.com">
+                                        </div>
+                                    </div>
+                                    <div class="mb-3">
+                                        <label class="form-label">Имя отправителя</label>
+                                        <input type="text" class="form-control" id="email-from-name" placeholder="Имя отправителя">
+                                    </div>
+                                    <button type="submit" class="btn btn-primary">
+                                        <i class="bi bi-save"></i> Сохранить
+                                    </button>
+                                </form>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- Модальное окно для объектов -->
+    <div class="modal fade" id="objectModal" tabindex="-1">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">Добавить объект</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Закрыть"></button>
+                </div>
+                <div class="modal-body">
+                    <form id="object-form">
+                        <div class="mb-3">
+                            <label class="form-label">ID</label>
+                            <input type="text" class="form-control" name="eldis_id">
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Период отчета</label>
+                            <input type="text" class="form-control" name="object_date" placeholder="23-24">
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Название объекта</label>
+                            <input type="text" class="form-control" name="name" required>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Номер вычислителя</label>
+                            <input type="text" class="form-control" name="calculator_number">
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Адрес</label>
+                            <input type="text" class="form-control" name="address">
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Email для отправки</label>
+                            <input type="text" class="form-control" name="email" placeholder="email1@domain.ru, email2@domain.ru">
+                            <div class="form-text">Можно указать несколько адресов через запятую</div>
+                        </div>
+                    </form>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Отмена</button>
+                    <button type="button" class="btn btn-primary" id="save-object">Сохранить</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Модальное окно для email источников -->
+    <div class="modal fade" id="email-source-modal" tabindex="-1">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">Добавить email источник</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Закрыть"></button>
+                </div>
+                <div class="modal-body">
+                    <form id="email-source-form">
+                        <div class="mb-3">
+                            <label class="form-label">Email</label>
+                            <input type="email" class="form-control" name="email" required>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Название</label>
+                            <input type="text" class="form-control" name="name">
+                        </div>
+                    </form>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Отмена</button>
+                    <button type="button" class="btn btn-primary" id="save-email-source">Сохранить</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Модальное окно входа -->
+    <div class="modal fade" id="loginModal" tabindex="-1" data-bs-backdrop="static">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">Вход в систему</h5>
+                </div>
+                <div class="modal-body">
+                    <form id="login-form">
+                        <div class="mb-3">
+                            <label class="form-label">Имя пользователя</label>
+                            <input type="text" class="form-control" id="login-username" required>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Пароль</label>
+                            <input type="password" class="form-control" id="login-password" required>
+                        </div>
+                        <div class="alert alert-danger" id="login-error" style="display: none;"></div>
+                    </form>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-primary" id="login-btn">Войти</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Модальное окно пользователей -->
+    <div class="modal fade" id="userModal" tabindex="-1">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">Добавить пользователя</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Закрыть"></button>
+                </div>
+                <div class="modal-body">
+                    <form id="user-form">
+                        <div class="mb-3">
+                            <label class="form-label">Имя пользователя</label>
+                            <input type="text" class="form-control" name="username" id="user-username" required>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Email</label>
+                            <input type="email" class="form-control" name="email" id="user-email">
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Пароль <span id="password-hint">(оставьте пустым для сохранения текущего)</span></label>
+                            <input type="password" class="form-control" name="password" id="user-password">
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Роль</label>
+                            <select class="form-select" name="role" id="user-role">
+                                <option value="operator">Оператор</option>
+                                <option value="admin">Администратор</option>
+                            </select>
+                        </div>
+                    </form>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Отмена</button>
+                    <button type="button" class="btn btn-primary" id="save-user">Сохранить</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Модальное окно доверенных адресов -->
+    <div class="modal fade" id="trustedEmailModal" tabindex="-1">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">Добавить доверенный адрес</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Закрыть"></button>
+                </div>
+                <div class="modal-body">
+                    <form id="trusted-email-form">
+                        <div class="mb-3">
+                            <label class="form-label">Email</label>
+                            <input type="email" class="form-control" name="email" required>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">Описание</label>
+                            <input type="text" class="form-control" name="description">
+                        </div>
+                    </form>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Отмена</button>
+                    <button type="button" class="btn btn-primary" id="save-trusted-email">Сохранить</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal fade" id="valueModal" tabindex="-1" aria-labelledby="value-title" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered"><div class="modal-content">
+            <div class="modal-header"><h5 class="modal-title" id="value-title">Полное значение</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Закрыть"></button></div>
+            <div class="modal-body"><div class="full-value" id="full-value" tabindex="0"></div></div>
+            <div class="modal-footer"><span id="copy-result" role="status" aria-live="polite"></span><button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Закрыть</button><button type="button" class="btn btn-primary" id="copy-value"><i class="bi bi-clipboard" aria-hidden="true"></i> Копировать</button></div>
+        </div></div>
+    </div>
+    <script src="vendor/bootstrap.bundle.min.js"></script>
+    <script src="presentation.js?v=6b8fef4"></script>
+    <script src="pipeline.js?v=brevo-delivery-20261109"></script>
+    <script src="app.js?v=mail-archive-20261105"></script>
+</body>
+</html>

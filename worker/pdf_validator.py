@@ -1,0 +1,553 @@
+import os
+import pdfplumber
+# import camelot  # отключен из-за OpenCV зависимостей
+import re
+from datetime import datetime, timezone, timedelta
+from typing import Dict, List, Optional, Tuple
+import json
+from celery_app import celery_app, UPLOAD_DIR
+from database import SessionLocal, get_db
+from utils import logger
+from models import Attachment as AttachmentModel, Object as ObjectModel
+
+class PDFValidator:
+    @staticmethod
+    def extract_text_and_tables(pdf_path: str) -> Dict:
+        """Извлечь текст и таблицы из PDF"""
+        try:
+            result = {
+                'text': '',
+                'tables': [],
+                'pages_count': 0,
+                'extraction_errors': []
+            }
+            
+            with pdfplumber.open(pdf_path) as pdf:
+                result['pages_count'] = len(pdf.pages)
+                
+                for page_num, page in enumerate(pdf.pages):
+                    try:
+                        page_text = page.extract_text()
+                        if page_text:
+                            result['text'] += f"\n--- Page {page_num + 1} ---\n{page_text}"
+                        
+                        tables = page.extract_tables()
+                        if tables:
+                            for table in tables:
+                                if table:
+                                    result['tables'].append(table)
+                    except Exception as e:
+                        result['extraction_errors'].append(f"Page {page_num + 1}: {str(e)}")
+                        continue
+                        
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error extracting PDF content: {e}")
+            return {
+                'text': '',
+                'tables': [],
+                'pages_count': 0,
+                'extraction_errors': [str(e)]
+            }
+
+    @staticmethod
+    def extract_calculator_number(text: str) -> Optional[str]:
+        """Извлечь номер вычислителя (теплосчетчика) из текста PDF"""
+        try:
+            # Приоритетные паттерны - ищем по ключевым словам
+            priority_patterns = [
+                # "Прибор: ТВ7 Заводской номер: 15017757" или "Прибор: ВКТ-7 Заводской номер: 37362"
+                r'Прибор[:\s]*(?:ТВ[78]|ВКТ-[789]|СПТ94[23])[^\n]*?Заводской\s*номер[=:]\s*(\d{4,})',
+                # "Заводской номер: 15017757" - standalone (after other context)
+                r'Заводской\s*номер[=:]\s*(\d{5,})',
+                # "Прибор: СПТ942 Заводской номер: 7590" (short number)
+                r'Прибор[:\s]*СПТ94\d[^\n]*?Заводской\s*номер[=:]\s*(\d+)',
+            ]
+            
+            # Проверяем приоритетные паттерны
+            for pattern in priority_patterns:
+                match = re.search(pattern, text, re.IGNORECASE)
+                if match:
+                    number = match.group(1).strip()
+                    if len(number) >= 4:
+                        logger.info(f"Found calculator number (priority): {number}")
+                        return number
+            
+            # Резервные паттерны - для сложных форматов
+            fallback_patterns = [
+                # "Тепловычислитель ВКТ-7 сет. N 61"
+                r'Тепловычислитель\s+ВКТ-[789]\s+(?:сет\.?\s*)?N[=:]\s*(\d+)',
+                # "Теплосчетчик МКТС: №005545-1"
+                r'Теплосчетчик\s+МКТС[:\s]№\s*([\d-]+)',
+                # "ТСРВ-026М №1318455" - with possible parentheses like ТСРВ-033(034)
+                r'ТСРВ[-\s]\w+(?:\(\w+\))?\s*№\s*(\d{4,})',
+                # "Сетевой номер NT=12345"
+                r'Сетевой\s*номер\s+NT[=:]\s*(\d{4,})',
+                # "Номер прибора: 1111250" (в адресном поле)
+                r'Номер\s*прибора[=:]\s*(\d{4,})',
+            ]
+            
+            for pattern in fallback_patterns:
+                match = re.search(pattern, text, re.IGNORECASE)
+                if match:
+                    number = match.group(1).strip()
+                    if number and len(number) >= 4:
+                        logger.info(f"Found calculator number (fallback): {number}")
+                        return number
+            
+            logger.debug("No calculator number found in text")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error extracting calculator number: {e}")
+            return None
+    
+    @staticmethod
+    def extract_object_info(text: str) -> Dict:
+        """Извлечь информацию об объекте из текста PDF"""
+        try:
+            result = {
+                'object_name': None,
+                'address': None
+            }
+            
+            # Потребитель
+            consumer_match = re.search(r'Потребитель[:\s]+(.+?)(?=\n)', text)
+            if consumer_match:
+                result['object_name'] = consumer_match.group(1).strip()
+            
+            # Объект (альтернативный формат: "Объект: Ивановская обл, ...")
+            if not result['object_name']:
+                object_match = re.search(r'Объект[:\s]+(.+?)(?=\n)', text)
+                if object_match:
+                    obj_text = object_match.group(1).strip()
+                    # Может содержать адрес и название в скобках
+                    # Формат: "Ивановская обл, ... (Название)"
+                    bracket_match = re.search(r'(.+?)\s*\(([^)]+)\)\s*$', obj_text)
+                    if bracket_match:
+                        result['address'] = bracket_match.group(1).strip()
+                        result['object_name'] = bracket_match.group(2).strip()
+                    else:
+                        result['object_name'] = obj_text
+            
+            # Адрес объекта (разные форматы)
+            address_patterns = [
+                r'Адрес объекта[:\s]+(.+?)(?=\n)',
+                r'Адрес[:\s]+(.+?)(?=\n)',
+            ]
+            for pattern in address_patterns:
+                address_match = re.search(pattern, text)
+                if address_match:
+                    result['address'] = address_match.group(1).strip()
+                    break
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error extracting object info: {e}")
+            return {'object_name': None, 'address': None}
+
+    @staticmethod
+    def validate_dates(text: str) -> Dict:
+        """Проверить даты в тексте на непрерывность"""
+        try:
+            # Ищем даты в формате ДД.ММ.ГГГГ
+            date_pattern = r'\b\d{2}\.\d{2}\.\d{4}\b'
+            dates = re.findall(date_pattern, text)
+            
+            # Проверяем валидность дат и конвертируем в объекты datetime
+            valid_dates = []
+            for date_str in dates:
+                try:
+                    dt = datetime.strptime(date_str, '%d.%m.%Y')
+                    valid_dates.append(dt)
+                except ValueError:
+                    continue
+            
+            # Сортируем даты
+            valid_dates.sort()
+            
+            # Даты OK если есть хотя бы одна дата
+            dates_ok = len(valid_dates) >= 1
+            
+            return {
+                'dates_found': len(dates),
+                'valid_dates': len(valid_dates),
+                'dates': [d.strftime('%d.%m.%Y') for d in valid_dates],
+                'dates_ok': dates_ok,
+                'has_gaps': False,  # Не проверяем пропуски
+                'missing_dates': [],
+                'date_range': {
+                    'from': valid_dates[0].strftime('%d.%m.%Y') if valid_dates else None,
+                    'to': valid_dates[-1].strftime('%d.%m.%Y') if valid_dates else None
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Error validating dates: {e}")
+            return {
+                'dates_found': 0,
+                'valid_dates': 0,
+                'dates': [],
+                'dates_ok': False,
+                'has_gaps': True,
+                'missing_dates': [],
+                'error': str(e)
+            }
+
+    @staticmethod
+    def _is_empty_cell(cell) -> bool:
+        """Проверить, является ли ячейка пустой (None, пустая строка, тире, нд)"""
+        if cell is None:
+            return True
+        cell_str = str(cell).strip()
+        if not cell_str:
+            return True
+        if cell_str.lower() in ('---', 'нд', '-', '–', '—'):
+            return True
+        return False
+
+    @staticmethod
+    def validate_tables(tables: List) -> Dict:
+        """Проверить таблицы - строки с датой, пустые ячейки, непрерывность дат"""
+        try:
+            if not tables:
+                return {
+                    'tables_found': 0,
+                    'valid_tables': 0,
+                    'tables_ok': False,
+                    'empty_cells_count': 0,
+                    'errors': ['No tables found'],
+                    'table_dates': [],
+                    'date_gaps': []
+                }
+            
+            valid_tables = 0
+            errors = []
+            empty_cells_count = 0
+            table_dates = []
+            
+            date_pattern = r'^\d{2}\.\d{2}\.\d{4}'
+            
+            for table_idx, table in enumerate(tables):
+                if table and len(table) > 0:
+                    table_has_empty = False
+                    for row_idx, row in enumerate(table):
+                        if not row:
+                            continue
+                        
+                        first_cell = str(row[0]).strip() if row[0] else ''
+                        
+                        if re.match(date_pattern, first_cell):
+                            table_dates.append(first_cell)
+                            
+                            for cell_idx, cell in enumerate(row):
+                                if cell_idx == len(row) - 1:
+                                    continue
+                                
+                                if PDFValidator._is_empty_cell(cell):
+                                    table_has_empty = True
+                                    empty_cells_count += 1
+                                    errors.append(
+                                        f"Table {table_idx + 1}, row {row_idx + 1}, "
+                                        f"col {cell_idx + 1}: empty"
+                                    )
+                    
+                    if not table_has_empty:
+                        valid_tables += 1
+                else:
+                    errors.append(f'Table {table_idx + 1}: empty table')
+            
+            # Check date continuity in table rows
+            date_gaps = []
+            if len(table_dates) >= 2:
+                parsed_dates = []
+                for d in table_dates:
+                    try:
+                        parsed_dates.append(datetime.strptime(d, '%d.%m.%Y'))
+                    except ValueError:
+                        continue
+                parsed_dates = sorted(set(parsed_dates))
+                for i in range(len(parsed_dates) - 1):
+                    expected = parsed_dates[i] + timedelta(days=1)
+                    if parsed_dates[i + 1] != expected:
+                        gap_start = parsed_dates[i].strftime('%d.%m.%Y')
+                        gap_end = parsed_dates[i + 1].strftime('%d.%m.%Y')
+                        date_gaps.append(f"Gap: {gap_start} → {gap_end}")
+            
+            tables_ok = (valid_tables == len(tables)
+                         and empty_cells_count == 0
+                         and not date_gaps)
+            
+            if date_gaps:
+                errors.extend(date_gaps)
+            
+            return {
+                'tables_found': len(tables),
+                'valid_tables': valid_tables,
+                'tables_ok': tables_ok,
+                'empty_cells_count': empty_cells_count,
+                'errors': errors,
+                'table_dates': sorted(set(table_dates)),
+                'date_gaps': date_gaps
+            }
+            
+        except Exception as e:
+            logger.error(f"Error validating tables: {e}")
+            return {
+                'tables_found': 0,
+                'valid_tables': 0,
+                'tables_ok': False,
+                'empty_cells_count': 0,
+                'errors': [str(e)],
+                'table_dates': [],
+                'date_gaps': []
+            }
+
+    @staticmethod
+    def validate_pdf(pdf_path: str) -> Dict:
+        """Полная валидация PDF"""
+        try:
+            # Extract content
+            content = PDFValidator.extract_text_and_tables(pdf_path)
+            
+            # Validate dates
+            dates_result = PDFValidator.validate_dates(content['text'])
+            
+            # Validate tables - check all cells are filled
+            tables_result = PDFValidator.validate_tables(content['tables'])
+            
+            # Extract calculator number
+            calculator_number = PDFValidator.extract_calculator_number(content['text'])
+            
+            # Extract object info (name and address)
+            object_info = PDFValidator.extract_object_info(content['text'])
+            
+            return {
+                'dates': dates_result,
+                'tables': tables_result,
+                'calculator_number': calculator_number,
+                'object_name': object_info['object_name'],
+                'address': object_info['address'],
+                'extraction_errors': content['extraction_errors']
+            }
+            
+        except Exception as e:
+            logger.error(f"Error validating PDF: {e}")
+            return {
+                'dates': {'dates_ok': False, 'error': str(e)},
+                'tables': {'tables_ok': False, 'error': str(e)},
+                'calculator_number': None,
+                'object_name': None,
+                'address': None,
+                'extraction_errors': [str(e)]
+            }
+
+@celery_app.task(bind=True, max_retries=3)
+def validate_pdf_attachment(self, attachment_id: str):
+    """Валидация PDF вложения"""
+    logger.info(f"Starting PDF validation for attachment {attachment_id}")
+    
+    db = SessionLocal()
+    try:
+        # Get attachment from DB
+        attachment = db.query(AttachmentModel).filter(AttachmentModel.id == attachment_id).first()
+        if not attachment:
+            logger.error(f"Attachment {attachment_id} not found")
+            return {'status': 'error', 'message': 'Attachment not found'}
+        
+        from common.config import legacy_blocked
+        if legacy_blocked(db, attachment):
+            return {'status': 'skipped', 'reason': 'reliable_pipeline_managed'}
+
+        # Check file exists
+        if not attachment.file_path or not os.path.exists(attachment.file_path):
+            logger.error(f"File not found: {attachment.file_path}")
+            attachment.status = 'rejected'
+            attachment.reject_reason = 'file_not_found'
+            db.commit()
+            return {'status': 'error', 'message': 'File not found'}
+        
+        # Validate PDF
+        validation_result = PDFValidator.validate_pdf(attachment.file_path)
+        
+        # Check for date gaps
+        has_gaps = validation_result['dates'].get('has_gaps', False)
+        # Check for empty cells in tables
+        tables_ok = validation_result['tables']['tables_ok']
+        empty_cells = validation_result['tables'].get('empty_cells_count', 0)
+        
+        # Extract calculator number
+        calculator_number = validation_result.get('calculator_number')
+        if calculator_number:
+            attachment.calculator_number = calculator_number
+            logger.info(f"Attachment {attachment_id} has calculator number: {calculator_number}")
+
+            # Check for inactive object first
+            inactive_obj = db.query(ObjectModel).filter(
+                ObjectModel.calculator_number == calculator_number,
+                ObjectModel.is_active == False
+            ).first()
+            if inactive_obj:
+                logger.info(f"Attachment {attachment_id}: object {inactive_obj.name} is inactive, rejecting")
+                attachment.status = 'rejected'
+                attachment.reject_reason = 'object_inactive'
+                attachment.object_id = inactive_obj.id
+                attachment.validation_result = validation_result
+                db.commit()
+                if attachment.file_path and os.path.exists(attachment.file_path):
+                    os.remove(attachment.file_path)
+                    logger.info(f"Deleted PDF for inactive object: {attachment.file_path}")
+                return {'status': 'rejected', 'reason': 'object_inactive', 'object_name': inactive_obj.name}
+
+            # Find object by calculator number and link it
+            obj = db.query(ObjectModel).filter(
+                ObjectModel.calculator_number == calculator_number,
+                ObjectModel.is_active == True
+            ).first()
+            if obj:
+                attachment.object_id = obj.id
+                logger.info(f"Attachment {attachment_id} linked to object {obj.name} (calculator: {calculator_number})")
+        
+        # Update message with object info if extracted from PDF
+        object_name = validation_result.get('object_name')
+        address = validation_result.get('address')
+        if object_name and attachment.message:
+            attachment.message.parsed_object = object_name
+            logger.info(f"Attachment {attachment_id} extracted object name: {object_name}")
+        if address and attachment.message:
+            attachment.message.parsed_address = address
+            logger.info(f"Attachment {attachment_id} extracted address: {address}")
+        
+        # Update attachment status based on validation
+        dates_ok = validation_result['dates']['dates_ok']
+        
+        validation_result['deterministic_dates_ok'] = dates_ok
+        validation_result['deterministic_tables_ok'] = tables_ok
+        
+        if dates_ok and tables_ok:
+            # Все поля заполнены
+            attachment.status = 'approved'
+            attachment.reject_reason = None
+            attachment.validation_result = validation_result
+            logger.info(f"Attachment {attachment_id} approved - all fields filled")
+
+            db.commit()
+            # Queue AFTER commit — worker must see committed data
+            finalize_validation.delay(attachment_id)
+            logger.info(f"Queued attachment {attachment_id} for final validation")
+        else:
+            # Есть пустые ячейки — сразу rejected
+            attachment.status = 'rejected'
+
+            reasons = []
+            if not tables_ok:
+                reasons.append(f'empty_cells:{empty_cells}')
+            if not dates_ok:
+                reasons.append('dates_invalid')
+
+            attachment.reject_reason = ';'.join(reasons)
+            attachment.validation_result = validation_result
+            logger.warning(f"Attachment {attachment_id} rejected: {reasons}")
+
+            db.commit()
+            # Queue AFTER commit — worker must see committed data
+            from email_sender import send_pdf_attachment
+            send_pdf_attachment.delay(attachment_id)
+            logger.info(f"Queued rejected attachment {attachment_id} for sending to admin")
+        
+        return {
+            'status': 'success',
+            'attachment_id': attachment_id,
+            'dates_ok': dates_ok,
+            'has_gaps': has_gaps,
+            'tables_ok': tables_ok,
+            'final_status': attachment.status
+        }
+        
+    except Exception as e:
+        logger.error(f"Error validating PDF: {e}")
+        db.rollback()
+        # Update attachment status to failed
+        attachment = db.query(AttachmentModel).filter(AttachmentModel.id == attachment_id).first()
+        if attachment:
+            attachment.status = 'rejected'
+            attachment.reject_reason = 'validation_error'
+            db.commit()
+        
+        return {'status': 'error', 'message': str(e)}
+    finally:
+        db.close()
+
+
+@celery_app.task
+def finalize_validation(attachment_id: str):
+    """Финализация валидации и принятие решения (детерминированная)"""
+    logger.info(f"Finalizing validation for attachment {attachment_id}")
+
+    with get_db() as db:
+        try:
+            attachment = db.query(AttachmentModel).filter(AttachmentModel.id == attachment_id).with_for_update().first()
+            if not attachment:
+                logger.error(f"Attachment {attachment_id} not found")
+                return {'status': 'error', 'message': 'Attachment not found'}
+
+            from common.config import legacy_blocked
+            if legacy_blocked(db, attachment) or attachment.status != 'approved':
+                return {'status': 'skipped', 'reason': 'unexpected_stage_or_reliable_pipeline'}
+
+            validation_result = dict(attachment.validation_result or {})
+
+            deterministic_dates_ok = validation_result.get('deterministic_dates_ok', False)
+            deterministic_tables_ok = validation_result.get('deterministic_tables_ok', False)
+
+            final_valid = deterministic_dates_ok and deterministic_tables_ok
+            final_dates_ok = deterministic_dates_ok
+            final_tables_ok = deterministic_tables_ok
+            reason = 'validated' if final_valid else 'deterministic_validation'
+
+            validation_result['final_dates_ok'] = final_dates_ok
+            validation_result['final_tables_ok'] = final_tables_ok
+            validation_result['final_valid'] = final_valid
+            validation_result['final_reason'] = reason
+
+            attachment.validation_result = validation_result
+
+            if final_valid:
+                attachment.status = 'validated'
+            else:
+                attachment.status = 'rejected'
+                if not final_dates_ok:
+                    attachment.reject_reason = 'dates'
+                elif not final_tables_ok:
+                    attachment.reject_reason = 'tables'
+                else:
+                    attachment.reject_reason = 'validation'
+
+            db.commit()
+            # Queue AFTER commit — worker must see committed data
+            from email_sender import send_pdf_attachment
+            send_pdf_attachment.delay(attachment_id)
+
+            logger.info(f"Validation finalized for attachment {attachment_id}: {attachment.status}")
+
+            return {
+                'status': 'success',
+                'final_valid': final_valid,
+                'attachment_status': attachment.status,
+                'reason': reason
+            }
+
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Error finalizing validation for attachment {attachment_id}: {e}")
+
+            attachment = db.query(AttachmentModel).filter(AttachmentModel.id == attachment_id).first()
+            if attachment:
+                attachment.status = 'rejected'
+                attachment.reject_reason = 'validation_error'
+                db.commit()
+
+            return {'status': 'error', 'message': str(e)}
+

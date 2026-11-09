@@ -1,0 +1,14 @@
+# Versions validated against the captured production runtime and isolated tests.
+SQLAlchemy==2.0.23
+celery==5.3.4
+kombu==5.6.2
+billiard==4.2.4
+redis==5.0.1
+psycopg2-binary==2.9.9
+fastapi==0.104.1
+pydantic==2.13.4
+alembic==1.12.1
+bcrypt==5.0.0
+pdfplumber==0.9.0
+pdfminer.six==20221105
+httpx==0.28.1

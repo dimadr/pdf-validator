@@ -1,0 +1,5 @@
+pytest==8.4.2
+pytest-timeout==2.4.0
+PyYAML==6.0.2
+reportlab==4.2.5
+aiosmtpd==1.4.6

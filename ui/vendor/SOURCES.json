@@ -1,0 +1,82 @@
+[
+  {
+    "path": "bootstrap.min.css",
+    "source": "https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css",
+    "sha256": "62f74b1cf824a89f03554c638e719594c309b4d8a627a758928c0516fa7890ab"
+  },
+  {
+    "path": "bootstrap.bundle.min.js",
+    "source": "https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js",
+    "sha256": "f5210fa3e7f0245a4c51eb7f280092c0ef99fdd28c45e17dab8cc5854fdf4fd3"
+  },
+  {
+    "path": "bootstrap-LICENSE.txt",
+    "source": "https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/LICENSE",
+    "sha256": "5b30317c9c35bb6f05101c501de866cc6852ab9b655dcf5941733f6644c3ebd0"
+  },
+  {
+    "path": "bootstrap-icons.css",
+    "source": "https://cdn.jsdelivr.net/npm/bootstrap-icons@1.7.2/font/bootstrap-icons.css",
+    "sha256": "bb18ec4bd71814b4e39a5afc8f98be0eabce2c206e811cc4796c5431665e6174"
+  },
+  {
+    "path": "fonts/bootstrap-icons.woff2",
+    "source": "https://cdn.jsdelivr.net/npm/bootstrap-icons@1.7.2/font/fonts/bootstrap-icons.woff2",
+    "sha256": "e9829fbbcc18407deb28b49dac24d8146981b22b4a4813f1699c7773e80c01b9"
+  },
+  {
+    "path": "fonts/bootstrap-icons.woff",
+    "source": "https://cdn.jsdelivr.net/npm/bootstrap-icons@1.7.2/font/fonts/bootstrap-icons.woff",
+    "sha256": "93f3cb0dc88139d393e34df47a0d440edc92c784a85a5d456f5ba2b54e1360e2"
+  },
+  {
+    "path": "bootstrap-icons-LICENSE.txt",
+    "source": "https://cdn.jsdelivr.net/npm/bootstrap-icons@1.7.2/LICENSE.md",
+    "sha256": "ae58b37f46d8c7eb680f0223a416a1d26f699a0968f537465256e9274e28da59"
+  },
+  {
+    "path": "inter/inter.css",
+    "source": "https://cdn.jsdelivr.net/npm/@fontsource-variable/inter@5.2.8/wght.css",
+    "sha256": "737c25ebf22e517553d17c3a0135db9828efca2e5e1b5de3e8bd0a9b2dfc259d"
+  },
+  {
+    "path": "inter/files/inter-cyrillic-ext-wght-normal.woff2",
+    "source": "https://cdn.jsdelivr.net/npm/@fontsource-variable/inter@5.2.8/files/inter-cyrillic-ext-wght-normal.woff2",
+    "sha256": "ca157063339ac4ad418f214f3abfed119b0798ab4d377386ce5c9e5a7a435ebd"
+  },
+  {
+    "path": "inter/files/inter-cyrillic-wght-normal.woff2",
+    "source": "https://cdn.jsdelivr.net/npm/@fontsource-variable/inter@5.2.8/files/inter-cyrillic-wght-normal.woff2",
+    "sha256": "71d5ee93cc1e9f1d520a3a8b66456de18c7879d8df09d57fcd2eaff75fef0075"
+  },
+  {
+    "path": "inter/files/inter-greek-ext-wght-normal.woff2",
+    "source": "https://cdn.jsdelivr.net/npm/@fontsource-variable/inter@5.2.8/files/inter-greek-ext-wght-normal.woff2",
+    "sha256": "6e9e020a25f9b56d418f2c085b1d3c09725a4da23fe693a5b463064606732190"
+  },
+  {
+    "path": "inter/files/inter-greek-wght-normal.woff2",
+    "source": "https://cdn.jsdelivr.net/npm/@fontsource-variable/inter@5.2.8/files/inter-greek-wght-normal.woff2",
+    "sha256": "1be3448e292fbf05ffe176fe1e43f135013d50b1e7d324ad1a558f623d3bb6f6"
+  },
+  {
+    "path": "inter/files/inter-vietnamese-wght-normal.woff2",
+    "source": "https://cdn.jsdelivr.net/npm/@fontsource-variable/inter@5.2.8/files/inter-vietnamese-wght-normal.woff2",
+    "sha256": "5c66f9e07e90c6d4ac4922cc68d60de26c17b1858e677fb5e603fce3952b3ff2"
+  },
+  {
+    "path": "inter/files/inter-latin-ext-wght-normal.woff2",
+    "source": "https://cdn.jsdelivr.net/npm/@fontsource-variable/inter@5.2.8/files/inter-latin-ext-wght-normal.woff2",
+    "sha256": "34b9c504cab7a73e37b746343a449132e56cf7b5481af2cb81dc74dcff25c956"
+  },
+  {
+    "path": "inter/files/inter-latin-wght-normal.woff2",
+    "source": "https://cdn.jsdelivr.net/npm/@fontsource-variable/inter@5.2.8/files/inter-latin-wght-normal.woff2",
+    "sha256": "3100e775e8616cd2611beecfa23a4263d7037586789b43f035236a2e6fbd4c62"
+  },
+  {
+    "path": "inter/LICENSE.txt",
+    "source": "https://cdn.jsdelivr.net/npm/@fontsource-variable/inter@5.2.8/LICENSE",
+    "sha256": "3b0a5fca3d17942cde889069889dedbbbd075e9b599968c82a95f4d944e9b345"
+  }
+]

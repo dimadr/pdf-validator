@@ -1,0 +1,21 @@
+{
+  "frozen_commit": "8b34dc0d1ac8e0289f818f340af33ac8d2b7dd5a",
+  "tag": "v2-brevo-20261109",
+  "baseline_tests": {
+    "python": 17,
+    "ui": 15,
+    "preflight": 38,
+    "linux": 2
+  },
+  "baseline_brevo_api": {
+    "exact_matches": 11,
+    "delivered": 11,
+    "open_signals": 5
+  },
+  "export": "source-only snapshot with generic identities and external credential configuration",
+  "export_tests": {
+    "python": 22,
+    "ui": 15
+  },
+  "export_test_fix": "Delivery history UI assertion updated to current wording"
+}

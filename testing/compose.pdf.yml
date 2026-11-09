@@ -1,0 +1,15 @@
+# Explicit opt-in: only verified local copies, never the parent directory.
+services:
+  test-runner:
+    environment:
+      PDF_FIXTURE_DIR: /fixtures/pdf
+      PDF_CAPTURE_FILE: /fixtures/pdf-corpus.json
+    volumes:
+      - type: bind
+        source: ${PDF_FIXTURE_DIR:?Set verified copied PDF fixture directory on the test host}
+        target: /fixtures/pdf
+        read_only: true
+      - type: bind
+        source: ${PDF_CAPTURE_FILE:?Set verified copied PDF capture JSON on the test host}
+        target: /fixtures/pdf-corpus.json
+        read_only: true

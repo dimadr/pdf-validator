@@ -1,0 +1,146 @@
+name: project1
+
+x-logging: &bounded-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+x-app-env: &app-env
+  DATABASE_URL: "${DATABASE_URL:?Set DATABASE_URL outside source control}"
+  REDIS_URL: "${REDIS_URL:-redis://redis:6379/0}"
+  UPLOAD_DIR: /app/uploads
+  PIPELINE_V2_ENABLED: "${PIPELINE_V2_ENABLED:-false}"
+
+services:
+  postgres:
+    image: postgres:15-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: email_processor
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD outside source control}"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U postgres -d email_processor"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    mem_limit: 768m
+    cpus: 1.0
+    pids_limit: 160
+    shm_size: 128m
+    logging: *bounded-logging
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: [redis-server, --appendonly, "yes", --appendfsync, everysec]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 64
+    logging: *bounded-logging
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${PROJECT1_BACKEND_PORT:-8001}:8000"
+    environment: *app-env
+    env_file: [.env]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    volumes:
+      - ./uploads:/app/uploads
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 128
+    logging: *bounded-logging
+
+  worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    restart: unless-stopped
+    command: [celery, -A, celery_app, worker, --loglevel=info, --concurrency=1, --prefetch-multiplier=1]
+    environment: *app-env
+    env_file: [.env]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    volumes:
+      - ./uploads:/app/uploads
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 2g
+    cpus: 2.0
+    pids_limit: 192
+    logging: *bounded-logging
+
+  celery-beat:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    restart: unless-stopped
+    command: [celery, -A, celery_app, beat, --loglevel=info, --schedule=/var/lib/celery/celerybeat-schedule]
+    environment: *app-env
+    env_file: [.env]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    volumes:
+      - ./uploads:/app/uploads
+      - beat_data:/var/lib/celery
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 64
+    logging: *bounded-logging
+
+  ui:
+    image: nginx:alpine
+    restart: unless-stopped
+    ports:
+      - "${PROJECT1_HTTPS_PORT:-4321}:443"
+      - "${PROJECT1_HTTP_PORT:-8080}:80"
+    volumes:
+      - ./ui:/usr/share/nginx/html:ro
+      - ./ui/nginx.conf:/etc/nginx/nginx.conf:ro
+      - "${PROJECT1_TLS_CERT_FILE:?Set existing TLS certificate file}:/etc/nginx/ssl/cert.pem:ro"
+      - "${PROJECT1_TLS_KEY_FILE:?Set existing TLS private key file}:/etc/nginx/ssl/key.pem:ro"
+    depends_on:
+      backend: {condition: service_healthy}
+    mem_limit: 96m
+    cpus: 0.5
+    pids_limit: 64
+    logging: *bounded-logging
+
+volumes:
+  postgres_data:
+  redis_data:
+  beat_data:

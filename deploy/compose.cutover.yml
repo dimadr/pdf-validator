@@ -1,0 +1,81 @@
+# Prepared release only. Do not start without the owner's explicit production GO.
+name: project1-v2
+x-environment: &environment
+  DATABASE_URL: "${DATABASE_URL:?Existing production DATABASE_URL required}"
+  REDIS_URL: "${REDIS_URL:?Existing production REDIS_URL required}"
+  SECRET_KEY: "${SECRET_KEY:?Existing application signing key required}"
+  PIPELINE_V2_ENABLED: "true"
+  CELERY_QUEUE: project1_v2
+  CELERY_REDIS_KEY_PREFIX: "project1_v2:"
+  UPLOAD_DIR: /app/uploads
+  # Legacy email_sender.py uses SMTP_USER as From; preserve that behavior explicitly.
+  SMTP_FROM: "${SMTP_FROM:-${SMTP_USER:?Existing legacy sender required}}"
+  IMAP_BOOTSTRAP_UID: "${IMAP_BOOTSTRAP_UID:?Capture and verify cutover UID before stopping legacy producer}"
+  AI_EXTERNAL_DOCUMENTS_APPROVED: "${AI_EXTERNAL_DOCUMENTS_APPROVED:-false}"
+  SMTP_TEST_MODE: "false"
+  BREVO_SMTP_KEY_FILE: /run/secrets/brevo_smtp_key
+  BREVO_DAILY_LIMIT: "${BREVO_DAILY_LIMIT:-300}"
+  AI_PROVIDER_MODE: routerai
+x-logging: &logging
+  driver: json-file
+  options: {max-size: "20m", max-file: "5"}
+x-app: &app
+  env_file: [/root/project1/.env]
+  environment: *environment
+  volumes: [/root/project1/uploads:/app/uploads]
+  read_only: true
+  tmpfs: [/tmp]
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  networks: [existing]
+  restart: unless-stopped
+  logging: *logging
+services:
+  backend:
+    <<: *app
+    volumes: [/root/project1/uploads:/app/uploads, /root/project1-next/deploy/secrets/brevo-smtp-key:/run/secrets/brevo_smtp_key:ro]
+    image: "${PROJECT1_BACKEND_IMAGE:?Set verified backend image digest}"
+    container_name: project1-v2-backend
+    working_dir: /app/backend
+    command: [uvicorn, backend.main:app, --host, 0.0.0.0, --port, "8000"]
+    ports: ["8001:8000"]
+    cpus: 0.5
+    mem_limit: 512m
+    pids_limit: 128
+  worker:
+    <<: *app
+    volumes: [/root/project1/uploads:/app/uploads, /root/project1-next/deploy/secrets/brevo-smtp-key:/run/secrets/brevo_smtp_key:ro]
+    image: "${PROJECT1_WORKER_IMAGE:?Set verified worker image digest}"
+    container_name: project1-v2-worker
+    command: [celery, -A, celery_app, worker, --loglevel=info, --concurrency=1, --prefetch-multiplier=1]
+    cpus: 1.0
+    mem_limit: 1g
+    pids_limit: 192
+  celery-beat:
+    <<: *app
+    image: "${PROJECT1_WORKER_IMAGE:?Set verified worker image digest}"
+    container_name: project1-v2-celery-beat
+    command: [celery, -A, celery_app, beat, --loglevel=info, --schedule=/var/lib/celery/celerybeat-schedule]
+    volumes: [/root/project1/uploads:/app/uploads, beat_v2:/var/lib/celery]
+    cpus: 0.25
+    mem_limit: 256m
+    pids_limit: 64
+  ui:
+    image: sha256:1d13701a5f9f3fb01aaa88cef2344d65b6b5bf6b7d9fa4cf0dca557a8d7702ba
+    container_name: project1-v2-ui
+    ports: ["4321:443", "8080:80"]
+    volumes:
+      - /root/project1-next/ui:/usr/share/nginx/html:ro
+      - /root/project1-next/deploy/nginx.cutover.conf:/etc/nginx/nginx.conf:ro
+      - /etc/ssl/mycert.pem:/etc/nginx/ssl/cert.pem:ro
+      - /etc/ssl/mycert-key.pem:/etc/nginx/ssl/key.pem:ro
+    networks: [existing]
+    cpus: 0.25
+    mem_limit: 128m
+    pids_limit: 64
+    restart: unless-stopped
+    logging: *logging
+networks:
+  existing: {external: true, name: project1_default}
+volumes:
+  beat_v2:
