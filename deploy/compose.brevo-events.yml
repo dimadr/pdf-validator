@@ -9,3 +9,5 @@ services:
         read_only: true
         bind:
           create_host_path: false
+  celery-beat:
+    image: "${PROJECT1_BREVO_BEAT_IMAGE:-${PROJECT1_WORKER_IMAGE}}"

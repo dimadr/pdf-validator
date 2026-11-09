@@ -364,7 +364,7 @@ class EmailProcessorAdmin {
                     <td>${this.escapeHtml(att.current_revision ? att.current_revision.calculator_number : att.calculator_number) || '-'}</td>
                     <td>${att.current_revision ? this.compactValue(att.current_revision.object_name || 'не определён', 'Объект') : (att.object ? this.compactValue(att.object.name, 'Объект') : '-')}</td>
                     <td>${this.deliverySender(att)}</td>
-                    <td>${statusBadge}${this.receiptIndicator(att)}</td>
+                    <td>${statusBadge}${this.confirmationIndicators(att)}</td>
                     <td>${reason ? this.compactValue(reason, 'Причина отказа') : '—'}</td>
                     <td>${new Date(att.created_at + 'Z').toLocaleString('ru-RU', {timeZone: 'Europe/Moscow'})}</td>
                     <td>
@@ -419,11 +419,25 @@ class EmailProcessorAdmin {
         return providers.length?providers.map(p=>this.escapeHtml(labels[p]||p)).join('<br>'):'—';
     }
 
-    receiptIndicator(att) {
-        if(this.documentStatus(att)!=='validated_sent')return '';
-        const received=att.read_receipt_received===true;
-        const label=received?'Получено уведомление о прочтении':'Уведомления о прочтении нет';
-        return ` <span class="read-receipt-dot ${received?'receipt-present':'receipt-missing'}" role="img" aria-label="${label}" title="${label}"></span>`;
+    confirmationIndicators(att) {
+        const {confirmed, brevo_delivered, read_confirmed, total} = att.client_delivery?.confirmation || {};
+        if (!total) return '';
+        const accepted = att.client_delivery.counts?.accepted || 0;
+        const sources = [brevo_delivered ? `Brevo Delivered — ${brevo_delivered}` : '',
+                         read_confirmed ? `MDN — ${read_confirmed}` : ''].filter(Boolean).join(', ');
+        const delivery = confirmed > 0
+            ? `Доставка подтверждена для ${confirmed} из ${total} адресатов${sources ? `. ${sources}` : ''}`
+            : `Доставка не подтверждена. Принято SMTP для ${accepted} из ${total} адресатов`;
+        const read = read_confirmed > 0
+            ? `Прочтение подтверждено по MDN для ${read_confirmed} из ${total} адресатов`
+            : 'Уведомлений о прочтении (MDN) нет';
+        const indicator = (signal, label, text, full) => {
+            const description = this.escapeHtml(text);
+            return `<span class="confirmation-indicator" data-signal="${signal}" role="img" aria-label="${description}" title="${description}">
+                <span class="confirmation-dot ${full ? 'confirmation-present' : 'confirmation-missing'}" aria-hidden="true"></span>${label}</span>`;
+        };
+        return `<div class="confirmation-indicators">${indicator('delivery','Доставка',delivery,confirmed === total)}
+            ${indicator('read','Прочтение',read,read_confirmed === total)}</div>`;
     }
 
     documentStatus(att) {

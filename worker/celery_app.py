@@ -40,7 +40,7 @@ celery_app.conf.update(
     beat_schedule={
         "reliable-outbox": {"task": "pipeline.dispatch_outbox", "schedule": 5.0},
         "reliable-reconciliation": {"task": "pipeline.reconcile", "schedule": 60.0},
-        "brevo-delivery-events": {"task": "pipeline.poll_brevo_events", "schedule": 600.0},
+        "brevo-delivery-events": {"task": "pipeline.poll_brevo_events", "schedule": 3600.0},
         "fetch-emails-every-2-minutes": {
             "task": "email_client.fetch_emails_task",
             "schedule": 120.0,  # 2 minutes

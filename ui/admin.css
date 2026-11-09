@@ -133,9 +133,11 @@ h6 { font-size: 13px; font-weight: 650; }
 .identifier { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
 .badge { display: inline-block; max-width: 100%; padding: 4px 7px; border-radius: 4px; font-size: 11px; line-height: 1.4; font-weight: 500; white-space: normal; text-align: left; }
 .badge.bg-success { color: #26704b; background: #edf7f1 !important; }
-.read-receipt-dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; vertical-align: middle; margin-left: 4px; }
-.receipt-present { background: #26704b; }
-.receipt-missing { background: #b63838; }
+.confirmation-indicators { display: flex; flex-wrap: wrap; gap: 2px 8px; margin-top: 3px; font-size: 10px; color: var(--muted); }
+.confirmation-indicator { display: inline-flex; align-items: center; gap: 3px; white-space: nowrap; }
+.confirmation-dot { flex: none; width: 7px; height: 7px; border-radius: 50%; }
+.confirmation-present { background: #26704b; }
+.confirmation-missing { background: #b63838; }
 .badge.bg-danger { color: #a33434; background: #fcf0f0 !important; }
 .badge.bg-warning { color: #875b0e; background: #fff6e4 !important; }
 .badge.bg-primary, .badge.bg-secondary, .badge.bg-info { color: #596273; background: #eff1f4 !important; }

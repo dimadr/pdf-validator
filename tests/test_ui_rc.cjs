@@ -82,19 +82,28 @@ test('sent label requires every current client and never administrative or previ
     assert.equal(admin.documentStatus({...item({accepted:2}),status:'archived'}),'archived');
 });
 
-for (const check of ['sender','receipt dots']) test(`sent rows show actual Brevo sender and red/green receipt dots: ${check}`,async()=>{
+test('document rows show independent delivery and MDN indicators',async()=>{
     const f=fixture(),rows=[];f.admin.renderPager=()=>{};f.admin.renderEmptyState=()=>{};
     f.node('#documents-table tbody').insertRow=()=>{const row=new Node();rows.push(row);return row;};
-    const item=read=>({id:'fixture',filename:'report.pdf',status:'new',created_at:'2026-11-03T06:41:54',
+    const cases=[
+        ['Mail.ru',1,1,1,1,true,true], ['Яндекс',1,1,0,1,true,false],
+        ['SMTP ACK',0,0,0,1,false,false], ['Brevo Opened',0,0,0,1,false,false],
+        ['MDN',1,0,1,1,true,true], ['Разные адресаты',2,1,1,2,true,false],
+        ['Частичная доставка',1,1,0,2,false,false],
+    ];
+    const item=([filename,confirmed,brevo_delivered,read_confirmed,total])=>({id:'fixture',filename,status:'new',created_at:'2026-11-03T06:41:54',
         message:{from_email:'noreply@eldis24.ru'},current_revision:{state:'validated',reason:'validated'},
-        client_delivery:{counts:{accepted:2},providers:['brevo']},read_receipt_received:read});
-    f.admin.apiCall=async()=>({total:2,items:[item(false),item(true)]});await f.admin.loadDocuments();
-    if(check==='sender') {
-        assert.match(rows[0].innerHTML,/Brevo/);
-        assert.doesNotMatch(rows[0].innerHTML,/noreply@eldis24.ru/);
-    } else {
-        assert.match(rows[0].innerHTML,/receipt-missing/);assert.match(rows[1].innerHTML,/receipt-present/);
+        client_delivery:{counts:{accepted:total},providers:['brevo'],confirmation:{confirmed,brevo_delivered,read_confirmed,total}}});
+    f.admin.apiCall=async()=>({total:cases.length,items:cases.map(item)});await f.admin.loadDocuments();
+    assert.match(rows[0].innerHTML,/Brevo/);
+    assert.doesNotMatch(rows[0].innerHTML,/noreply@eldis24.ru/);
+    for (const [i,[label,,,,,delivery,read]] of cases.entries()) {
+        const actual=[...rows[i].innerHTML.matchAll(/data-signal="(delivery|read)"[^>]*>\s*<span class="confirmation-dot (confirmation-present|confirmation-missing)"/g)];
+        assert.deepEqual(actual.map(m=>[m[1],m[2]==='confirmation-present']),[['delivery',delivery],['read',read]],label);
     }
+    assert.match(rows[0].innerHTML,/Brevo Delivered — 1, MDN — 1/);
+    assert.match(rows[4].innerHTML,/MDN — 1/);
+    assert.match(rows[6].innerHTML,/Доставка подтверждена для 1 из 2/);
 });
 
 test('SMTP selection requires confirmation, retains expected provider and hides controls from operators',async()=>{
@@ -194,13 +203,16 @@ test('Brevo delivery and read confirmation render independently with admin event
     const {admin}=fixture();
     admin.apiCall=async endpoint=>endpoint.includes('/delivery-events?')
         ? {total:1,items:[{event:'blocked',provider:'brevo',reason:'<script>bad</script>',smtp_attempt:1}]}
-        : {total:1,items:[{id:'delivery-id',recipient:'one@example.com',role:'client',state:'accepted',
-            delivery:{status:'delivered',event_count:1,opened_at:'2026-11-09T08:33:00Z'}}]};
+        : {total:2,items:[{id:'delivery-id',recipient:'one@example.com',role:'client',state:'accepted',
+            delivery:{status:'delivered',event_count:1,opened_at:'2026-11-09T08:33:00Z'}},
+            {id:'mdn-id',recipient:'two@example.com',role:'client',state:'accepted',delivery:{status:'unknown'},
+                read_confirmed_at:'2026-11-09T08:35:00Z'}]};
     const html=await admin.pipeline.historyHTML('test');
     assert.match(html,/<th>Доставка<\/th><th>Прочтение<\/th>/);
     assert.match(html,/Доставлено на почтовый сервер/);
     assert.match(html,/Нет подтверждения/);
     assert.match(html,/Сигнал открытия Brevo/);
+    assert.match(html,/Доставка подтверждена по MDN/);
     assert.match(html,/js-brevo-events/);
     assert.doesNotMatch(await admin.pipeline.brevoEventsHTML('test','delivery-id',0),/<script>/);
     admin.currentUser.role='operator';

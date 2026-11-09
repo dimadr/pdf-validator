@@ -96,7 +96,8 @@ globalThis.PipelineUI = class PipelineUI {
         const rows = page.items.map(row => `<tr><td>${this.admin.compactValue(row.recipient, 'Адрес получателя')}</td>` +
             `<td>${row.role === 'client' ? 'Клиент' : 'Администратор'}</td>` +
             `<td>${escape(labels[row.state] || row.state)}</td>` +
-            `<td>${escape(deliveryLabels[row.delivery?.status] || deliveryLabels.unknown)}` +
+            `<td>${row.read_confirmed_at && (!row.delivery?.status || row.delivery.status === 'unknown')
+                ? 'Доставка подтверждена по MDN' : escape(deliveryLabels[row.delivery?.status] || deliveryLabels.unknown)}` +
             (row.delivery?.reason ? `<br>${this.admin.compactValue(row.delivery.reason, 'Причина доставки')}` : '') +
             (row.delivery?.opened_at ? `<br><small>Сигнал открытия Brevo ${escape(this.admin.formatTime(row.delivery.opened_at))}</small>` : '') +
             (this.admin.currentUser?.role === 'admin' && row.delivery?.event_count > 0 ?

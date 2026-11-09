@@ -4,6 +4,7 @@ import hashlib
 import os
 from datetime import timezone
 from pathlib import Path
+from uuid import UUID
 
 from sqlalchemy import select, func
 from common.brevo_delivery import FINAL_EVENTS
@@ -33,9 +34,12 @@ def pipeline_view(db, attachment):
     if revision is not None and revision.object_id:
         obj=db.get(Object,revision.object_id)
         view['object_name']=obj.name if obj else None
+    client = client_delivery(db, revision.id) if revision else None
+    if client and client['intent_id'] and revision.state == 'validated' and attachment.status != 'archived':
+        client['confirmation'] = _client_confirmation(db, attachment.id, UUID(client['intent_id']))
     return {'current_revision_id':attachment.current_revision_id,
             'current_revision':view,'recipient_state_counts':counts,
-            'client_delivery':client_delivery(db,revision.id) if revision else None,
+            'client_delivery':client,
             'effective_status':revision.state if revision else attachment.status,
             'legacy_history_only':revision is None}
 
@@ -101,6 +105,29 @@ def _delivery_summary(events):
             'opened_at': max(opens, default=None), 'event_count': len(events)}
 
 
+def _brevo_events(db, deliveries):
+    ids = [row.id for row in deliveries if row.smtp_provider == 'brevo']
+    events = {}
+    if ids:
+        for delivery_id, event in db.execute(select(SMTPAttempt.delivery_id, BrevoDeliveryEvent)
+                .join(BrevoDeliveryEvent, SMTPAttempt.id == BrevoDeliveryEvent.smtp_attempt_id)
+                .where(SMTPAttempt.delivery_id.in_(ids), SMTPAttempt.provider == 'brevo')):
+            events.setdefault(delivery_id, []).append(event)
+    return events
+
+
+def _client_confirmation(db, attachment_id, intent_id):
+    clients = db.scalars(select(RecipientDelivery).where(RecipientDelivery.intent_id == intent_id,
+        RecipientDelivery.role == 'client')).all()
+    accepted = [row for row in clients if row.state == 'accepted']
+    events = _brevo_events(db, accepted)
+    delivered = {delivery_id for delivery_id, history in events.items()
+                 if _delivery_summary(history)['status'] == 'delivered'}
+    reads = _read_confirmations(db, attachment_id, accepted)
+    return {'total': len(clients), 'confirmed': len(delivered.union(reads)),
+            'brevo_delivered': len(delivered), 'read_confirmed': len(reads)}
+
+
 def delivery_page(db, attachment_id, skip=0, limit=100):
     query=select(RecipientDelivery,DeliveryIntent,ProcessingRevision.id.label('revision_id'))\
         .join(DeliveryIntent,RecipientDelivery.intent_id==DeliveryIntent.id)\
@@ -109,14 +136,9 @@ def delivery_page(db, attachment_id, skip=0, limit=100):
     total=db.scalar(select(func.count()).select_from(query.subquery()))
     rows=db.execute(query.order_by(RecipientDelivery.created_at.desc(),RecipientDelivery.id)
                     .offset(skip).limit(limit)).all()
-    reads = _read_confirmations(db, attachment_id, [delivery for delivery, _, _ in rows])
-    brevo_ids = [delivery.id for delivery, _, _ in rows if delivery.smtp_provider == 'brevo']
-    events = {}
-    if brevo_ids:
-        for delivery_id, event in db.execute(select(SMTPAttempt.delivery_id, BrevoDeliveryEvent)
-                .join(BrevoDeliveryEvent, SMTPAttempt.id == BrevoDeliveryEvent.smtp_attempt_id)
-                .where(SMTPAttempt.delivery_id.in_(brevo_ids), SMTPAttempt.provider == 'brevo')):
-            events.setdefault(delivery_id, []).append(event)
+    deliveries = [delivery for delivery, _, _ in rows]
+    reads = _read_confirmations(db, attachment_id, deliveries)
+    events = _brevo_events(db, deliveries)
     items=[]
     for delivery,intent,revision_id in rows:
         values={key:getattr(delivery,key) for key in ('id','intent_id','recipient','original_address','role',

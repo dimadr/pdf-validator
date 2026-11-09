@@ -6,12 +6,22 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from backend.pipeline_views import delivery_page
+from backend.pipeline_views import delivery_page, pipeline_view
 from common import brevo_delivery as integration
 from common.delivery import deliver_recipient, plan_intent
 from common.ingest import BlobStore, ingest_uid
-from common.models import BrevoDeliveryEvent, BrevoPollCheckpoint, ProcessingRevision, RecipientDelivery, SMTPAttempt, Setting, utcnow
+from common.models import Attachment, BrevoDeliveryEvent, BrevoPollCheckpoint, ProcessingRevision, RecipientDelivery, SMTPAttempt, Setting, utcnow
 from test_api_rc import api, api_databases, seed as api_seed
+
+
+def test_brevo_is_polled_hourly_without_slowing_imap(monkeypatch):
+    monkeypatch.setenv('DATABASE_URL', 'sqlite://')
+    monkeypatch.setenv('REDIS_URL', 'memory://')
+    from worker.celery_app import celery_app
+
+    schedule = celery_app.conf.beat_schedule
+    assert schedule['brevo-delivery-events'] == {'task': 'pipeline.poll_brevo_events', 'schedule': 3600.0}
+    assert schedule['fetch-emails-every-2-minutes']['schedule'] == 120.0
 
 
 class Ack:
@@ -19,7 +29,7 @@ class Ack:
         return {'code': 250, 'response': f'2.0.0 OK: queued as <provider-{work["id"].hex}@relay.example.com>'}
 
 
-def send(factory, record, addresses, provider='brevo'):
+def send(factory, record, addresses, provider='brevo', kind='automatic'):
     with factory.begin() as db:
         setting = db.scalar(select(Setting).where(Setting.key == 'smtp_provider'))
         if setting is None:
@@ -27,7 +37,7 @@ def send(factory, record, addresses, provider='brevo'):
             db.add(setting)
         setting.value = provider
         revision = db.get(ProcessingRevision, UUID(str(record['revision'])))
-        intent = plan_intent(db, revision, [(address, 'client') for address in addresses], f'test-{revision.id}')
+        intent = plan_intent(db, revision, [(address, 'client') for address in addresses], f'test-{revision.id}-{kind}', kind=kind)
         db.flush()
         rows = list(db.scalars(select(RecipientDelivery).where(RecipientDelivery.intent_id == intent.id)))
         ids = {row.recipient: row.id for row in rows}
@@ -101,6 +111,10 @@ def test_exact_provider_identity_per_recipient_and_mdn_independent(session_facto
         assert rows[alice]['delivery']['status'] == 'delivered' and rows[alice]['read_confirmed_at']
         assert rows[bob]['delivery']['status'] == 'unknown' and rows[bob]['delivery']['opened_at']
         assert rows[bob]['read_confirmed_at'] is None
+        attachment = db.get(Attachment, first['attachment'])
+        assert pipeline_view(db, attachment)['client_delivery']['confirmation'] == {
+            'confirmed': 1, 'total': 2, 'brevo_delivered': 1, 'read_confirmed': 1,
+        }
         bounce = delivery_page(db, second['attachment'])['items'][0]['delivery']
         assert bounce['status'] == 'bounced' and bounce['reason'] == 'Mailbox unavailable'
         assert delivery_page(db, fallback['attachment'])['items'][0]['delivery']['status'] == 'unknown'
@@ -191,3 +205,52 @@ def test_admin_event_history_is_scoped(api, tmp_path, mock_api):
     assert response.status_code == 200 and response.json()['items'][0]['recipient'] == address
     api.user.role = 'operator'
     assert api.request('GET', path).status_code == 403
+
+
+def test_document_list_counts_delivery_and_mdn_independently_for_current_clients(api, tmp_path, mock_api):
+    factory = sessionmaker(bind=api.engine)
+    both, delivered, ack, opened, read, partial = [api_seed(api.engine, tmp_path, validated=True) for _ in range(6)]
+    alice, bob = 'alice@example.com', 'bob@example.com'
+    both_ids = send(factory, both, [alice])
+    delivered_ids = send(factory, delivered, [alice])
+    ack_ids = send(factory, ack, [alice])
+    opened_ids = send(factory, opened, [alice])
+    partial_ids = send(factory, partial, [alice, bob])
+    send(factory, read, [alice], provider='timeweb')
+    now = utcnow()
+    with factory.begin() as db:
+        for item in (both, read):
+            attachment = db.get(Attachment, UUID(item['attachment']))
+            attachment.read_receipt_received = True
+            attachment.read_receipt_at = now
+
+    pages = {provider_id(both_ids[alice]): [event(both_ids[alice], alice, 'delivered', now)],
+             provider_id(delivered_ids[alice]): [event(delivered_ids[alice], alice, 'delivered', now)],
+             provider_id(ack_ids[alice]): [],
+             provider_id(opened_ids[alice]): [event(opened_ids[alice], alice, 'opened', now)],
+             provider_id(partial_ids[alice]): [event(partial_ids[alice], alice, 'delivered', now)],
+             provider_id(partial_ids[bob]): [event(partial_ids[bob], bob, 'opened', now)]}
+    client = mock_api(lambda request: httpx.Response(200, json={'events': pages[request.url.params['messageId']]}))
+    integration.poll_brevo(factory, client, now)
+
+    def documents():
+        response = api.request('GET', '/api/v1/attachments')
+        assert response.status_code == 200, response.text
+        return {row['id']: row for row in response.json()}
+
+    rows = documents()
+    for item, total, confirmed, brevo, mdn in (
+        (both, 1, 1, 1, 1), (delivered, 1, 1, 1, 0), (ack, 1, 0, 0, 0),
+        (opened, 1, 0, 0, 0), (read, 1, 1, 0, 1), (partial, 2, 1, 1, 0),
+    ):
+        assert rows[item['attachment']]['client_delivery']['confirmation'] == {
+            'confirmed': confirmed, 'total': total, 'brevo_delivered': brevo, 'read_confirmed': mdn,
+        }
+
+    send(factory, delivered, [alice], kind='manual_resend')
+    send(factory, read, [alice], provider='timeweb', kind='manual_resend')
+    rows = documents()
+    for item in (delivered, read):
+        assert rows[item['attachment']]['client_delivery']['confirmation'] == {
+            'confirmed': 0, 'total': 1, 'brevo_delivered': 0, 'read_confirmed': 0,
+        }
