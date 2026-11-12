@@ -34,8 +34,9 @@ class SMTPTransport:
         message['Disposition-Notification-To']=cfg['sender'];message['X-Priority']='3'
         message['Subject']=work['payload'].get('subject','PDF report')
         message.set_content(work['payload'].get('body','PDF report attached'))
-        message.add_attachment(work['content'],maintype='application',subtype='pdf',
-            filename=work['payload'].get('filename','report.pdf'))
+        filename=work['payload'].get('filename','report.pdf')
+        subtype='vnd.ms-excel' if isinstance(filename,str) and filename.lower().endswith('.xls') else 'pdf'
+        message.add_attachment(work['content'],maintype='application',subtype=subtype,filename=filename)
         server=None;submission_started=False
         try:
             context=ssl.create_default_context()

@@ -99,11 +99,15 @@ def dispatch_outbox(session_factory,publish,limit=100,after_publish=None):
                 return count
     return count
 
+def _inactive_blocks_delivery(revision,obj,role):
+    return (obj is not None and not obj.is_active
+            and (role!='admin' or not str(revision.file_path or '').lower().endswith('.xls')))
+
 def _route_error(attachment,revision,obj,role):
     if attachment.status=='archived':return 'attachment_archived'
     if attachment.current_revision_id!=revision.id or revision.state in ('received','extracting','technical_error','discarded_inactive'):
         return 'stale_or_unavailable_revision'
-    if obj is not None and not obj.is_active:return 'object_inactive'
+    if _inactive_blocks_delivery(revision,obj,role):return 'object_inactive'
     if role=='client' and (revision.state!='validated' or obj is None):return 'client_route_not_validated'
     if role=='client' and obj.calculator_number!=revision.calculator_number:return 'object_binding_changed'
 
@@ -127,7 +131,7 @@ def _claim(session_factory,delivery_id,owner,lease_seconds,max_attempts):
             if attachment.current_revision_id!=revision.id or revision.state in ('received','extracting','technical_error','discarded_inactive'):
                 delivery.state='cancelled';delivery.error_code='stale_or_unavailable_revision';return None
             obj=db.scalar(select(Object).where(Object.id==revision.object_id).with_for_update()) if revision.object_id else None
-            if obj is not None and not obj.is_active:
+            if _inactive_blocks_delivery(revision,obj,delivery.role):
                 delivery.state='cancelled';delivery.error_code='object_inactive';return None
             if delivery.role=='client' and (revision.state!='validated' or obj is None):
                 delivery.state='cancelled';delivery.error_code='client_route_not_validated';return None
