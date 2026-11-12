@@ -2,14 +2,16 @@
 import os,uuid,hashlib,pathlib
 from datetime import timedelta
 from sqlalchemy import select
-from common.models import Attachment,Object,ProcessingRevision,DeliveryIntent
+from common.models import Attachment,Object,ProcessingRevision,DeliveryIntent,RecipientDelivery
 from common.config import require_schema
 from common.delivery import enqueue,plan_intent,now,normalized,ServiceConflict
 
+def _xls_review_already_accepted(db, attachment_id, review_email):
+    return db.scalar(select(RecipientDelivery.id).join(DeliveryIntent).join(ProcessingRevision)
+        .where(ProcessingRevision.attachment_id==attachment_id, RecipientDelivery.role=='admin',
+               RecipientDelivery.recipient==review_email, RecipientDelivery.state=='accepted').limit(1)) is not None
+
 def validate_revision(session_factory,revision_id,analyzer=None,owner=None,lease_seconds=1800,after_claim=None):
-    if analyzer is None:
-        from common.pdf_validation import analyze_pdf
-        analyzer=analyze_pdf
     owner=str(owner or uuid.uuid4())
     with session_factory() as db:
         with db.begin():
@@ -30,16 +32,24 @@ def validate_revision(session_factory,revision_id,analyzer=None,owner=None,lease
             context={'message_subject':message.subject if message else '', 'received_at':message.received_at if message else None}
             work={'path':revision.file_path,'sha256':revision.content_sha256,'parent':parent,'attempts':attempts,
                 'operation':previous.get('operation','automatic'),'context':context}
-    # Claim/attempt is durable before invoking a possibly crashing PDF parser.
+    # Claim/attempt is durable before invoking a possibly crashing parser.
     if after_claim:after_claim(work)
     path=pathlib.Path(work['path'] or '')
+    is_xls=path.suffix.lower()=='.xls'
     if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest()!=work['sha256']:
         result={'state':'technical_error','reason':'content_unavailable','identity_state':'missing','calculator_number':None,'terminal_error':True}
+    elif is_xls:
+        from common.xls_validation import analyze_xls
+        result=analyze_xls(str(path))
     else:
+        if analyzer is None:
+            from common.pdf_validation import analyze_pdf
+            analyzer=analyze_pdf
         try:result=dict(analyzer(str(path),context=work['context']))
         except Exception:result={'state':'technical_error','reason':'extraction_failed','identity_state':'missing','calculator_number':None}
-    from common.ai_fallback import run_fallback
-    result=run_fallback(session_factory,revision_id,result,work['context'])
+    if not is_xls:
+        from common.ai_fallback import run_fallback
+        result=run_fallback(session_factory,revision_id,result,work['context'])
     result['attempts']=attempts;result['operation']=work['operation']
     with session_factory() as db:
         try:
@@ -65,10 +75,11 @@ def validate_revision(session_factory,revision_id,analyzer=None,owner=None,lease
                     state,reason='technical_error','invalid_analyzer_contract'
                 obj=None
                 if result.get('identity_state')!='unique' or not revision.calculator_number:
-                    if state not in ('technical_error','rejected'):state,reason='review_required','identity_'+result.get('identity_state','missing')
+                    if state not in ('technical_error','rejected') and (not is_xls or state=='validated'):
+                        state,reason='review_required','identity_'+result.get('identity_state','missing')
                 else:
                     obj=db.scalar(select(Object).where(Object.calculator_number==revision.calculator_number))
-                    if obj is not None and not obj.is_active:
+                    if obj is not None and not obj.is_active and not is_xls:
                         # The retained/discarded disposition is terminal even after later object activation.
                         revision.state='discarded_inactive';revision.reason='object_inactive';revision.object_id=obj.id;revision.finished_at=now()
                         result['disposition']='discarded_inactive'
@@ -77,6 +88,8 @@ def validate_revision(session_factory,revision_id,analyzer=None,owner=None,lease
                         return {'state':revision.state}
                     if obj is None and state=='validated':state,reason='review_required','exact_object_not_found'
                     elif obj is not None:revision.object_id=obj.id
+                    if is_xls and obj is not None and not obj.is_active and state=='validated':
+                        state,reason='review_required','object_inactive'
                 client_recipients=[]
                 if state=='validated':
                     try:
@@ -94,6 +107,11 @@ def validate_revision(session_factory,revision_id,analyzer=None,owner=None,lease
                     kind='manual_resend' if result['operation']=='manual_resend' else 'automatic'
                 else:
                     recipients=[(r,'admin') for r in [os.getenv('ADMIN_EMAIL'),os.getenv('NOTIFY_EMAIL')] if r]
+                    if is_xls:
+                        review_email=os.getenv('XLS_REVIEW_EMAIL','').strip().lower()
+                        recipients=[]
+                        if review_email and not _xls_review_already_accepted(db,attachment.id,review_email):
+                            recipients=[(review_email,'admin')]
                     kind='admin_notification'
                 if recipients:
                     from common.mail_content import client_payload,review_payload

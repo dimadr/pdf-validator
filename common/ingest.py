@@ -50,13 +50,20 @@ def mime_manifest(raw):
     for index,part in enumerate(message.walk()):
         if part.is_multipart():continue
         filename=safe_header(part.get_filename())
-        if not (part.get_content_type()=='application/pdf' or filename.lower().endswith('.pdf')):continue
+        mime_type=part.get_content_type()
+        is_pdf=mime_type=='application/pdf' or filename.lower().endswith('.pdf')
+        is_xls=filename.lower().endswith('.xls') or (not filename and mime_type=='application/vnd.ms-excel')
+        if not (is_pdf or is_xls):continue
         content=part.get_payload(decode=True)
+        # Excel 97–2003 uses an OLE container. A wrong PDF label must not route it to PDF/AI.
+        is_xls=is_xls or bool(content and content.startswith(b'\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1'))
+        fallback='document.xls' if is_xls else 'document.pdf'
+        format_fields={'format':'xls'} if is_xls else {}
         if content is None:
-            parts.append({'part_index':index,'filename':filename or 'document.pdf','state':'decode_error','content':None})
+            parts.append({'part_index':index,'filename':filename or fallback,'state':'decode_error','content':None,**format_fields})
             continue
-        parts.append({'part_index':index,'filename':pathlib.Path(filename.replace('\\','/')).name or 'document.pdf',
-            'sha256':hashlib.sha256(content).hexdigest(),'size':len(content),'content':content})
+        parts.append({'part_index':index,'filename':pathlib.Path(filename.replace('\\','/')).name or fallback,
+            'sha256':hashlib.sha256(content).hexdigest(),'size':len(content),'content':content,**format_fields})
     return message,parts,receipt
 
 def ingest_uid(session_factory,store,account,mailbox,uidvalidity,uid,raw,*,matched_receipt_only=False):
@@ -128,32 +135,33 @@ def ingest_uid(session_factory,store,account,mailbox,uidvalidity,uid,raw,*,match
     failures=[]
     for part in parts:
         try:
-            if part['content'] is None:raise ValueError('Undecodable MIME PDF retained in raw message')
+            if part['content'] is None:raise ValueError('Undecodable attachment retained in raw message')
             digest=part['sha256']
             with session_factory() as db:
                 with db.begin():
                     db.execute(select(func.pg_advisory_xact_lock(int.from_bytes(bytes.fromhex(digest)[:8],'big',signed=True))))
                     attachment=db.scalar(select(Attachment).where(Attachment.file_sha256==digest))
                     if attachment is None:
-                        pdf_path,_=store.put(part['content'],'.pdf')
-                        attachment=Attachment(id=uuid.uuid4(),message_id=existing_id,filename=part['filename'][:255],file_path=pdf_path,
+                        suffix='.xls' if part.get('format')=='xls' else '.pdf'
+                        file_path,_=store.put(part['content'],suffix)
+                        attachment=Attachment(id=uuid.uuid4(),message_id=existing_id,filename=part['filename'][:255],file_path=file_path,
                             file_sha256=digest,file_size=part['size'],status='new')
                         db.add(attachment);db.flush()
                         request_reprocess(db,attachment.id,'ingest:'+str(existing_id)+':'+str(part['part_index']))
                         disposition='saved'
                     else:
                         current=db.get(ProcessingRevision,attachment.current_revision_id) if attachment.current_revision_id else None
-                        pdf_path=attachment.file_path
+                        file_path=attachment.file_path
                         if current and current.state=='discarded_inactive':disposition='discarded_inactive'
-                        elif not pdf_path or not pathlib.Path(pdf_path).is_file():disposition='historical_content_unavailable'
+                        elif not file_path or not pathlib.Path(file_path).is_file():disposition='historical_content_unavailable'
                         else:
-                            if hashlib.sha256(pathlib.Path(pdf_path).read_bytes()).hexdigest()!=digest:
+                            if hashlib.sha256(pathlib.Path(file_path).read_bytes()).hexdigest()!=digest:
                                 raise ValueError('Existing attachment integrity conflict')
                             disposition='deduplicated'
                     parent=db.get(IncomingMessage,existing_id)
                     manifest=[dict(p) for p in parent.part_manifest]
                     for p in manifest:
-                        if p['part_index']==part['part_index']:p.update(state=disposition,attachment_id=str(attachment.id),file_path=pdf_path,raw_part_available=True)
+                        if p['part_index']==part['part_index']:p.update(state=disposition,attachment_id=str(attachment.id),file_path=file_path,raw_part_available=True)
                     parent.part_manifest=manifest
         except Exception:
             failures.append(part['part_index'])
