@@ -363,19 +363,49 @@ def analyze_capture(text, tables, context=None):
         issues.extend({**issue, 'table': index} for issue in result['issues'])
     if not series or not any(row['kind'] in {'daily', 'hourly'} for row in series):
         issues.append(_issue('daily_series_missing', severity='review_required'))
-    if any(issue['severity'] == 'rejected' for issue in issues):
-        state = 'rejected'
-    elif any(issue['severity'] == 'review_required' for issue in issues):
-        state = 'review_required'
-    elif issues:
-        state = 'rejected'
-    else:
-        state = 'validated'
+    state = _validation_state(issues)
     return {
         'state': state, 'calculator_number': number, 'identity_state': identity_state,
         'serial_candidates': candidates, 'reason': ';'.join(sorted({issue['code'] for issue in issues})) or 'validated',
         'issues': issues, 'adapter_version': ADAPTER_VERSION, 'instrument_models': families,
         'series': series, 'checked_rows': sum(row['checked_rows'] for row in series),
+    }
+
+
+def _validation_state(issues):
+    if any(issue['severity'] == 'rejected' for issue in issues):
+        return 'rejected'
+    if any(issue['severity'] == 'review_required' for issue in issues):
+        return 'review_required'
+    return 'rejected' if issues else 'validated'
+
+
+def _analyze_meter_pages(pages, candidates, context):
+    """Validate every printed page under its own unambiguous instrument label."""
+    issues, series, models, periods = [], [], set(), set()
+    for index, (text, tables) in enumerate(pages, 1):
+        if _identity(text)[0] != 'unique':
+            return None
+        result = analyze_capture(text, tables, context)
+        meter = result['calculator_number']
+        models.update(result['instrument_models'])
+        issues.extend({**issue, 'page': index, 'meter': meter} for issue in result['issues'])
+        for report in result['series']:
+            if report['period']:
+                periods.add((report['period']['start'], report['period']['end']))
+            series.append({
+                **report, 'page': index, 'series_id': f"page-{index}-{report['series_id']}",
+                'circuit_key': f"page-{index}-{report['circuit_key']}",
+            })
+
+    if len(periods) > 1:
+        issues.append(_issue('multiple_declared_periods', severity='review_required'))
+
+    return {
+        'state': _validation_state(issues), 'calculator_number': None, 'identity_state': 'multiple',
+        'serial_candidates': candidates, 'reason': ';'.join(sorted({issue['code'] for issue in issues})) or 'validated',
+        'issues': issues, 'adapter_version': ADAPTER_VERSION, 'instrument_models': sorted(models),
+        'series': series, 'checked_rows': sum(report['checked_rows'] for report in series),
     }
 
 
@@ -386,12 +416,19 @@ def analyze_pdf(path, context=None):
     try:
         if not Path(path).is_file():
             raise FileNotFoundError('missing_pdf')
-        texts, tables = [], []
+        pages = []
         with pdfplumber.open(path) as pdf:
-            for index, page in enumerate(pdf.pages):
-                texts.append(f'\n--- Page {index + 1} ---\n{page.extract_text() or ""}')
-                tables.extend(page.extract_tables() or [])
-        return analyze_capture(''.join(texts), tables, context)
+            for page in pdf.pages:
+                text = _text(page.extract_text())
+                pages.append((text, page.extract_tables() or []))
+        text = ''.join(f'\n--- Page {index} ---\n{page}' for index, (page, _) in enumerate(pages, 1))
+        identity_state, candidates = _identity(text)
+        if identity_state == 'ambiguous':
+            grouped = _analyze_meter_pages(pages, candidates, context)
+            if grouped is not None:
+                return grouped
+        tables = [table for _, page_tables in pages for table in page_tables]
+        return analyze_capture(text, tables, context)
     except Exception as error:
         code = 'pdf_missing' if isinstance(error, FileNotFoundError) else 'pdf_extraction_failed'
         return {

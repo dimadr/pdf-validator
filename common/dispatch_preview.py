@@ -5,6 +5,7 @@ import hashlib,json,pathlib
 from sqlalchemy import select,func
 from common.models import Attachment,IncomingMessage,ProcessingRevision,Object,RecipientDelivery,DeliveryIntent
 from common.delivery import normalized,ServiceConflict
+from common.object_binding import object_binding_matches
 from common.smtp_settings import selection,quota_used,quota_limit
 
 MSK=timezone(timedelta(hours=3))
@@ -38,7 +39,7 @@ def preview(db,date_from,date_to,external_brevo_used=None):
         elif any(d.state in ('in_flight','uncertain') for d in rows):category='held';eligible=[]
         elif state=='rejected':category='rejected';reasons[reason or state]+=1
         elif state!='validated':category='review_required'
-        elif not obj or obj.calculator_number!=revision.calculator_number:category='review_required';reason='object_binding_changed';eligible=[]
+        elif not object_binding_matches(db,obj,revision):category='review_required';reason='object_binding_changed';eligible=[]
         elif not pathlib.Path(revision.file_path or '').is_file():category='review_required';reason='content_unavailable';eligible=[]
         else:
             clients=[d for d in rows if d.role=='client']

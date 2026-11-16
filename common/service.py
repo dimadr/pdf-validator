@@ -1,5 +1,6 @@
 """Application commands. Caller commits command state and outbox atomically."""
 import uuid,hashlib,pathlib
+from common.object_binding import object_binding_matches
 from sqlalchemy import select,func,update,or_
 from common.models import Attachment,Object,ProcessingRevision,DeliveryIntent,RecipientDelivery
 from common.config import require_schema
@@ -78,7 +79,7 @@ def request_resend(db,attachment_id,request_key,expected_revision_id=None):
     revision=db.get(ProcessingRevision,attachment.current_revision_id)
     if revision.state!='validated':raise ServiceConflict('Client resend requires validated current revision')
     obj=db.get(Object,revision.object_id) if revision.object_id else None
-    if obj is None or not obj.is_active or obj.calculator_number!=revision.calculator_number or not obj.email:
+    if obj is None or not obj.is_active or not object_binding_matches(db,obj,revision) or not obj.email:
         raise ServiceConflict('Active exact object and recipients required')
     recipients=[(x.strip(),'client') for x in obj.email.split(',') if x.strip()]
     from common.mail_content import client_payload
