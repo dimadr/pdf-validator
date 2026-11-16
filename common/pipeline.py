@@ -4,6 +4,7 @@ from datetime import timedelta
 from sqlalchemy import select
 from common.models import Attachment,Object,ProcessingRevision,DeliveryIntent,RecipientDelivery
 from common.config import require_schema
+from common.object_binding import resolve_pdf_object
 from common.delivery import enqueue,plan_intent,now,normalized,ServiceConflict
 
 def _xls_review_already_accepted(db, attachment_id, review_email):
@@ -61,7 +62,7 @@ def validate_revision(session_factory,revision_id,analyzer=None,owner=None,lease
                 if attachment.current_revision_id!=revision.id or revision.state!='extracting' or revision.owner!=owner:
                     return {'state':'stale'}
                 revision.owner=None;revision.lease_until=None
-                revision.validation_result=result;revision.parser_version=result.get('adapter_version','unknown')
+                revision.validation_result=dict(result);revision.parser_version=result.get('adapter_version','unknown')
                 revision.calculator_number=result.get('calculator_number');revision.object_id=None
                 state=result.get('state','technical_error');reason=result.get('reason')
                 if result.get('ai',{}).get('state')=='used':
@@ -74,20 +75,33 @@ def validate_revision(session_factory,revision_id,analyzer=None,owner=None,lease
                 if state not in ('validated','rejected','review_required','technical_error'):
                     state,reason='technical_error','invalid_analyzer_contract'
                 obj=None
-                if result.get('identity_state')!='unique' or not revision.calculator_number:
+                multiple_pdf = not is_xls and result.get('identity_state') == 'multiple'
+                if not multiple_pdf and (result.get('identity_state') != 'unique' or not revision.calculator_number):
                     if state not in ('technical_error','rejected') and (not is_xls or state=='validated'):
                         state,reason='review_required','identity_'+result.get('identity_state','missing')
                 else:
-                    obj=db.scalar(select(Object).where(Object.calculator_number==revision.calculator_number))
+                    if is_xls:
+                        obj=db.scalar(select(Object).where(Object.calculator_number==revision.calculator_number))
+                        binding_error='exact_object_not_found'
+                    else:
+                        serials = result.get('serial_candidates') if multiple_pdf else [revision.calculator_number]
+                        obj, binding_error = resolve_pdf_object(db, serials)
+                        if multiple_pdf and obj is not None and not obj.is_active:
+                            obj, binding_error = None, 'object_inactive'
                     if obj is not None and not obj.is_active and not is_xls:
                         # The retained/discarded disposition is terminal even after later object activation.
                         revision.state='discarded_inactive';revision.reason='object_inactive';revision.object_id=obj.id;revision.finished_at=now()
                         result['disposition']='discarded_inactive'
+                        revision.validation_result=dict(result)
                         # File cleanup is a separate idempotent outbox action after this commit.
                         enqueue(db,'pipeline.discard_content',{'revision_id':str(revision.id)})
                         return {'state':revision.state}
-                    if obj is None and state=='validated':state,reason='review_required','exact_object_not_found'
-                    elif obj is not None:revision.object_id=obj.id
+                    if obj is None and state == 'validated':
+                        state, reason = 'review_required', binding_error
+                    elif obj is not None:
+                        revision.object_id = obj.id
+                        if not is_xls:
+                            result['object_meter_serials'] = serials
                     if is_xls and obj is not None and not obj.is_active and state=='validated':
                         state,reason='review_required','object_inactive'
                 client_recipients=[]

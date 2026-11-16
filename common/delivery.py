@@ -3,6 +3,7 @@ import hashlib,json,uuid,os
 from datetime import datetime,timezone,timedelta
 from email.utils import format_datetime
 from sqlalchemy import select,update,func
+from common.object_binding import object_binding_matches
 from common.models import Attachment,Object,ProcessingRevision,DeliveryIntent,RecipientDelivery,OutboxEvent,SMTPAttempt
 
 def now():
@@ -103,13 +104,13 @@ def _inactive_blocks_delivery(revision,obj,role):
     return (obj is not None and not obj.is_active
             and (role!='admin' or not str(revision.file_path or '').lower().endswith('.xls')))
 
-def _route_error(attachment,revision,obj,role):
+def _route_error(db,attachment,revision,obj,role):
     if attachment.status=='archived':return 'attachment_archived'
     if attachment.current_revision_id!=revision.id or revision.state in ('received','extracting','technical_error','discarded_inactive'):
         return 'stale_or_unavailable_revision'
     if _inactive_blocks_delivery(revision,obj,role):return 'object_inactive'
     if role=='client' and (revision.state!='validated' or obj is None):return 'client_route_not_validated'
-    if role=='client' and obj.calculator_number!=revision.calculator_number:return 'object_binding_changed'
+    if role=='client' and not object_binding_matches(db,obj,revision):return 'object_binding_changed'
 
 def _claim(session_factory,delivery_id,owner,lease_seconds,max_attempts):
     with session_factory() as db:
@@ -135,7 +136,7 @@ def _claim(session_factory,delivery_id,owner,lease_seconds,max_attempts):
                 delivery.state='cancelled';delivery.error_code='object_inactive';return None
             if delivery.role=='client' and (revision.state!='validated' or obj is None):
                 delivery.state='cancelled';delivery.error_code='client_route_not_validated';return None
-            if delivery.role=='client' and obj.calculator_number!=revision.calculator_number:
+            if delivery.role=='client' and not object_binding_matches(db,obj,revision):
                 delivery.state='cancelled';delivery.error_code='object_binding_changed';return None
             ai=(revision.validation_result or {}).get('ai',{})
             if delivery.role=='client' and ai.get('state')=='used':
@@ -190,7 +191,7 @@ def deliver_recipient(session_factory,delivery_id,smtp_transport,owner=None,leas
                 revision=fence.get(ProcessingRevision,fence.get(DeliveryIntent,current.intent_id).revision_id)
                 obj=fence.scalar(select(Object).where(Object.id==revision.object_id).with_for_update()) if revision.object_id else None
                 if current.state!='in_flight' or current.owner!=work['owner']:return {'state':'skipped','reason':'claim_expired_before_smtp'}
-                route_error=_route_error(attachment,revision,obj,current.role)
+                route_error=_route_error(fence,attachment,revision,obj,current.role)
                 if route_error:
                     current.state='cancelled';current.error_code=route_error;current.lease_until=None;current.retry_at=None
                     fence.execute(update(SMTPAttempt).where(SMTPAttempt.id==work['attempt_id']).values(state='failed',error_code=route_error,finished_at=now()))
