@@ -75,8 +75,8 @@ def validate_revision(session_factory,revision_id,analyzer=None,owner=None,lease
                 if state not in ('validated','rejected','review_required','technical_error'):
                     state,reason='technical_error','invalid_analyzer_contract'
                 obj=None
-                multiple_pdf = not is_xls and result.get('identity_state') == 'multiple'
-                if not multiple_pdf and (result.get('identity_state') != 'unique' or not revision.calculator_number):
+                identities = ('unique',) if is_xls else ('unique', 'multiple')
+                if result.get('identity_state') not in identities or not revision.calculator_number:
                     if state not in ('technical_error','rejected') and (not is_xls or state=='validated'):
                         state,reason='review_required','identity_'+result.get('identity_state','missing')
                 else:
@@ -84,10 +84,8 @@ def validate_revision(session_factory,revision_id,analyzer=None,owner=None,lease
                         obj=db.scalar(select(Object).where(Object.calculator_number==revision.calculator_number))
                         binding_error='exact_object_not_found'
                     else:
-                        serials = result.get('serial_candidates') if multiple_pdf else [revision.calculator_number]
+                        serials = [revision.calculator_number]
                         obj, binding_error = resolve_pdf_object(db, serials)
-                        if multiple_pdf and obj is not None and not obj.is_active:
-                            obj, binding_error = None, 'object_inactive'
                     if obj is not None and not obj.is_active and not is_xls:
                         # The retained/discarded disposition is terminal even after later object activation.
                         revision.state='discarded_inactive';revision.reason='object_inactive';revision.object_id=obj.id;revision.finished_at=now()
