@@ -80,7 +80,7 @@ def _stamp(value, context=None):
     return day, clock
 
 
-def _identity(text):
+def _identity(text, *, document_order=False):
     labels = [
         r'Заводской\s*номер\s*(?:[:=]\s*)?',
         r'Номер\s*прибора\s*(?:[:=]\s*)?',
@@ -88,12 +88,14 @@ def _identity(text):
         r'ТСРВ[-\s][^\n№]*№\s*',
         r'Тепловычислитель\s+СПТ94[^\n]*?идентификатор\s+ИД\s*=\s*',
     ]
-    candidates = set()
+    positions = {}
     for label in labels:
         for match in re.finditer(label + SERIAL, text, re.I):
-            if 4 <= len(match.group(1)) <= 50:
-                candidates.add(match.group(1))
-    candidates = sorted(candidates)
+            number = match.group(1)
+            if 4 <= len(number) <= 50:
+                start = match.start(1)
+                positions[number] = min(start, positions.get(number, start))
+    candidates = sorted(positions, key=positions.get) if document_order else sorted(positions)
     state = 'unique' if len(candidates) == 1 else 'ambiguous' if candidates else 'missing'
     return state, candidates
 
@@ -338,7 +340,7 @@ def _check_series(table, index, adapter, period, period_source, number, context)
     }
 
 
-def analyze_capture(text, tables, context=None):
+def analyze_capture(text, tables, context=None, *, require_identity=True):
     """Analyze captured text/tables with no DB, network, file or task effects."""
     context = context or {}
     text = str(text or '').replace('\u00a0', ' ').replace('\u202f', ' ')
@@ -346,7 +348,7 @@ def analyze_capture(text, tables, context=None):
     number = candidates[0] if identity_state == 'unique' else None
     families = _families(text)
     issues = []
-    if identity_state != 'unique':
+    if require_identity and identity_state != 'unique':
         issues.append(_issue(f'identity_{identity_state}', severity='review_required'))
     if not families:
         issues.append(_issue('unknown_instrument_format', severity='review_required'))
@@ -380,21 +382,90 @@ def _validation_state(issues):
     return 'rejected' if issues else 'validated'
 
 
-def _analyze_meter_pages(pages, candidates, context):
-    """Validate every printed page under its own unambiguous instrument label."""
-    issues, series, models, periods = [], [], set(), set()
+def _continuation_rows(prior_headers, text, table, first_data):
+    """Use matching extracted headers, or independently visible column names."""
+    if first_data:
+        return first_data if [_label(h) for h in _headers(table)] == [_label(h) for h in prior_headers] else None
+    header = ' '.join(' '.join(h.casefold().split()) for h in prior_headers)
+    visible = {' '.join(line.casefold().split()) for line in text.splitlines()}
+    if header in visible and all(len(row) == len(prior_headers) for row in table if row):
+        return 0
+    return None
+
+
+def _continues_daily_period(old_text, old_table, adapter, new_row, context):
+    layout, kind, headers = adapter
+    period, _, _ = _period(old_text, context)
+    if kind != 'daily' or not period:
+        return False
+    new_stamp = _stamp(_text(new_row[0]).splitlines()[0], context)
+    old_rows, _, _ = _normalized_rows(old_table, layout, headers, context)
+    return bool(new_stamp and old_rows and
+                period[0] <= max(stamp[0] for stamp, _ in old_rows) < new_stamp[0] <= period[1])
+
+
+def _printouts(pages, context):
+    """Keep report boundaries and join only verifiable continuation tables."""
+    groups, unverified = [], {}
+    period_context = {'received_at': (context or {}).get('received_at')}
     for index, (text, tables) in enumerate(pages, 1):
-        if _identity(text)[0] != 'unique':
-            return None
-        result = analyze_capture(text, tables, context)
+        if groups and tables and groups[-1][2]:
+            start, old_text, old_tables, page_numbers = groups[-1]
+            old_table, table = old_tables[-1], tables[0]
+            old_serials, new_serials = set(_identity(old_text)[1]), set(_identity(text)[1])
+            old_models, new_models = _families(old_text), _families(text)
+            _, period_source, problems = _period(text, period_context)
+            declared_period = period_source or any(issue['code'] != 'expected_period_missing' for issue in problems)
+            marked = re.search(r'^\s*(?:продолжение\b|(?:страница|стр\.)\s*(?:[2-9]|\d{2,})\s+из\s+\d+\b)', text, re.I | re.M)
+            printout_title = re.search(r'^\s*(?:отч[её]т|ведомость|распечатка)\b', text, re.I | re.M)
+            first_data = next((i for i, row in enumerate(table) if row and re.match(DATE_TOKEN, _text(row[0]))), None)
+            closed = any(row and _label(row[0]).startswith(('итого', 'средние', 'сумма')) for row in old_table)
+            metadata_match = not (new_serials - old_serials or set(new_models) - set(old_models))
+            adapter = _table_adapter(old_table, old_models, old_text) if metadata_match and not closed else None
+            if adapter and first_data is not None and (marked or not (declared_period or printout_title) and
+                    _continues_daily_period(old_text, old_table, adapter, table[first_data], context)):
+                row_start = _continuation_rows(adapter[2], text, table, first_data)
+                if row_start is not None:
+                    joined = [*old_tables[:-1], [*old_table, *table[row_start:]], *tables[1:]]
+                    groups[-1] = (start, old_text + '\n' + text, joined, [*page_numbers, index])
+                    continue
+                if not marked or first_data == 0:
+                    unverified[start] = index
+            if marked and metadata_match and first_data != 0:
+                groups[-1] = (start, old_text + '\n' + text, [*old_tables, *tables], [*page_numbers, index])
+                continue
+        groups.append((index, text, tables, [index]))
+    return groups, unverified
+
+
+def _analyze_printouts(pages, identity_state, candidates, context):
+    """Validate each report over its full period independently of its meter number."""
+    issues, series, models, periods = [], [], set(), set()
+    if identity_state == 'missing':
+        issues.append(_issue('identity_missing', severity='review_required'))
+    groups, unverified = _printouts(pages, context)
+    for index, text, tables, page_numbers in groups:
+        result = analyze_capture(text, tables, context, require_identity=False)
         meter = result['calculator_number']
+        if index in unverified:
+            issues.append(_issue('continuation_unverified', severity='review_required', page=unverified[index]))
+            last_table = len(tables) - 1
+            # Keep the missing dates visible while the boundary is in review.
+            for issue in result['issues']:
+                if (issue['code'], issue.get('table')) == ('missing_daily_dates', last_table):
+                    issue['severity'] = 'review_required'
+            for report in result['series']:
+                if report['series_id'] == f'table-{last_table}':
+                    for issue in report['issues']:
+                        if issue['code'] == 'missing_daily_dates':
+                            issue['severity'] = 'review_required'
         models.update(result['instrument_models'])
         issues.extend({**issue, 'page': index, 'meter': meter} for issue in result['issues'])
         for report in result['series']:
             if report['period']:
                 periods.add((report['period']['start'], report['period']['end']))
             series.append({
-                **report, 'page': index, 'series_id': f"page-{index}-{report['series_id']}",
+                **report, 'page': index, 'pages': page_numbers, 'series_id': f"page-{index}-{report['series_id']}",
                 'circuit_key': f"page-{index}-{report['circuit_key']}",
             })
 
@@ -402,7 +473,8 @@ def _analyze_meter_pages(pages, candidates, context):
         issues.append(_issue('multiple_declared_periods', severity='review_required'))
 
     return {
-        'state': _validation_state(issues), 'calculator_number': None, 'identity_state': 'multiple',
+        'state': _validation_state(issues), 'calculator_number': candidates[0] if candidates else None,
+        'identity_state': 'multiple' if identity_state == 'ambiguous' else identity_state,
         'serial_candidates': candidates, 'reason': ';'.join(sorted({issue['code'] for issue in issues})) or 'validated',
         'issues': issues, 'adapter_version': ADAPTER_VERSION, 'instrument_models': sorted(models),
         'series': series, 'checked_rows': sum(report['checked_rows'] for report in series),
@@ -422,11 +494,9 @@ def analyze_pdf(path, context=None):
                 text = _text(page.extract_text())
                 pages.append((text, page.extract_tables() or []))
         text = ''.join(f'\n--- Page {index} ---\n{page}' for index, (page, _) in enumerate(pages, 1))
-        identity_state, candidates = _identity(text)
-        if identity_state == 'ambiguous':
-            grouped = _analyze_meter_pages(pages, candidates, context)
-            if grouped is not None:
-                return grouped
+        identity_state, candidates = _identity(text, document_order=True)
+        if len(pages) > 1 or identity_state == 'ambiguous':
+            return _analyze_printouts(pages, identity_state, candidates, context)
         tables = [table for _, page_tables in pages for table in page_tables]
         return analyze_capture(text, tables, context)
     except Exception as error:

@@ -27,37 +27,43 @@ def set_pdf(monkeypatch, pages):
     [
         ('single', 'validated', 'validated'),
         ('shared', 'validated', 'validated'),
-        ('different', 'review_required', 'meters_belong_to_different_objects'),
-        ('unknown', 'review_required', 'exact_object_not_found'),
-        ('duplicate', 'review_required', 'ambiguous_object_binding'),
+        ('different', 'validated', 'validated'),
+        ('unknown_later', 'validated', 'validated'),
+        ('unknown_first', 'review_required', 'exact_object_not_found'),
+        ('duplicate_later', 'validated', 'validated'),
+        ('duplicate_first', 'review_required', 'ambiguous_object_binding'),
         ('missing_day', 'rejected', 'missing_daily_dates'),
         ('empty', 'rejected', 'empty_required_measurement'),
         ('different_periods', 'review_required', 'multiple_declared_periods'),
-        ('unlabelled', 'review_required', 'identity_ambiguous'),
+        ('unlabelled', 'validated', 'validated'),
+        ('unlabelled_error', 'rejected', 'empty_required_measurement'),
     ],
 )
 def test_pdf_meter_routing(session_factory, seed, monkeypatch, case, state, reason):
     record = seed(state='received')
-    first = report_page('0012345')
-    second = report_page('0098765', days=(1,) if case == 'missing_day' else (1, 2),
+    first = report_page('0098765')
+    second = report_page('0012345', days=(1,) if case == 'missing_day' else (1, 2),
                          quantity=None if case == 'empty' else '0')
     if case == 'different_periods':
-        second = report_page('0098765', days=(2, 3), period=(2, 3))
+        second = report_page('0012345', days=(2, 3), period=(2, 3))
     pages = [first] if case == 'single' else [first, second]
-    if case == 'unlabelled':
-        pages.append(report_page(''))
+    if case in ('unlabelled', 'unlabelled_error'):
+        pages.append(report_page('', quantity=None if case == 'unlabelled_error' else '0'))
     set_pdf(monkeypatch, pages)
-    other = seed(state='received') if case in ('different', 'duplicate') else None
+    other = seed(state='received') if case in ('different', 'duplicate_later', 'duplicate_first') else None
     with session_factory.begin() as db:
         obj = db.get(Object, record['object'])
         obj.calculator_number = {
-            'different': '0012345',
-            'unknown': '0012345, 0098765A',
-        }.get(case, ' 0098765, 0012345 ')
+            'different': '0098765',
+            'unknown_later': '0098765, 0012345A',
+            'unknown_first': '0012345',
+        }.get(case, ' 0012345, 0098765 ')
         if other:
-            db.get(Object, other['object']).calculator_number = (
-                '0098765' if case == 'different' else '0098765, 555555'
-            )
+            db.get(Object, other['object']).calculator_number = {
+                'different': '0012345',
+                'duplicate_later': '0012345, 555555',
+                'duplicate_first': '0098765, 555555',
+            }[case]
 
     assert validate_revision(session_factory, record['revision'])['state'] == state
     with session_factory() as db:
@@ -68,39 +74,44 @@ def test_pdf_meter_routing(session_factory, seed, monkeypatch, case, state, reas
         assert len(intents) == 1
         if state == 'validated':
             assert revision.object_id == record['object']
-            expected = ['0012345'] if case == 'single' else ['0012345', '0098765']
-            assert revision.validation_result['object_meter_serials'] == expected
-            assert {series['meter'] for series in revision.validation_result['series']} == set(expected)
+            expected = ['0098765'] if case == 'single' else ['0098765', '0012345']
+            assert revision.validation_result['serial_candidates'] == expected
+            assert revision.calculator_number == '0098765'
+            assert revision.validation_result['object_meter_serials'] == ['0098765']
+            assert {series['meter'] for series in revision.validation_result['series'] if series['meter']} == set(expected)
+            assert len(revision.validation_result['series']) == (3 if case == 'unlabelled' else len(expected))
             assert sorted((row.role, row.recipient) for row in deliveries) == [
                 ('client', 'one@example.invalid'), ('client', 'two@example.invalid'),
             ]
         else:
             assert deliveries and all(row.role == 'admin' for row in deliveries)
             if state == 'rejected':
-                assert any(issue.get('meter') == '0098765' and issue['code'] == reason
+                page = 3 if case == 'unlabelled_error' else 2
+                assert any(issue.get('page') == page and issue['code'] == reason
                            for issue in revision.validation_result['issues'])
 
 
-@pytest.mark.parametrize('changed', [False, True])
+@pytest.mark.parametrize('changed', ['other_number', 'routing_number'])
 def test_pdf_binding_rechecked_before_smtp(session_factory, seed, monkeypatch, changed):
     record = seed(state='received', recipients='client@example.invalid')
-    set_pdf(monkeypatch, [report_page('0012345'), report_page('0098765')])
+    set_pdf(monkeypatch, [report_page('0098765'), report_page('0012345')])
     with session_factory.begin() as db:
-        db.get(Object, record['object']).calculator_number = '0012345, 0098765'
+        db.get(Object, record['object']).calculator_number = '0098765, 0012345'
     assert validate_revision(session_factory, record['revision'])['role'] == 'client'
     with session_factory.begin() as db:
         delivery = db.scalar(select(RecipientDelivery.id))
         request_resend(db, record['attachment'], 'multi-meter-retry', record['revision'])
 
     def change_binding(_):
-        if changed:
-            with session_factory.begin() as db:
-                db.get(Object, record['object']).calculator_number = '0012345'
+        with session_factory.begin() as db:
+            db.get(Object, record['object']).calculator_number = (
+                '0012345' if changed == 'routing_number' else '0098765'
+            )
 
     sent = []
     transport = SimpleNamespace(send=lambda work: sent.append((work['recipient'], work['content'])))
     result = deliver_recipient(session_factory, delivery, transport, before_smtp=change_binding)
-    if changed:
+    if changed == 'routing_number':
         assert result == {'state': 'cancelled', 'reason': 'object_binding_changed'}
         assert sent == []
     else:
