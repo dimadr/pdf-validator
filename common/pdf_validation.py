@@ -17,10 +17,10 @@ SERIAL = r'([0-9][0-9A-Za-zА-Яа-я]*(?:-[0-9A-Za-zА-Яа-я]+)*)(?![0-9A-Za-
 EMPTY = {'', '-', '–', '—', '---', 'нд', 'н/д'}
 COUNTER_COLUMNS = {
     'v1', 'v2', 'v3', 'v4', 'm', 'м', 'm1', 'm2', 'm3', 'm4', 'м1', 'м2', 'м3', 'м4',
-    'mу', 'му', 'my', 'мy', 'mг', 'мг', 'mгв', 'мгв', 'mtv', 'мтв', 'мтс', 'dм', 'dm',
+    'mу', 'му', 'my', 'мy', 'mг', 'мг', 'mгв', 'мгв', 'mtv', 'мтв', 'мтс', 'mтс', 'dм', 'dm',
     'q', 'q1', 'q2', 'q3', 'q4', 'qo', 'qg', 'qг', 'qtv', 'qтв', 'q12', 'qnt', 'qnthip', 'qntp',
-    'w', 'w6', 'wтс', 'wгв', 'wгвс', 'wбезгвс', 'twork', 'tns', 'tи', 'ти',
-    'внр', 'вос', 'траб', 'tраб', 'тнар', 'тот', 'тпит', 'треж', 'тнс',
+    'w', 'w1', 'w2', 'w6', 'wтс', 'wгв', 'wгвс', 'wбезгвс', 'twork', 'tns', 'tи', 'ти',
+    'внр', 'вос', 'траб', 'tраб', 'тнар', 'tнар', 'тот', 'тпит', 'треж', 'тнс',
     'времяраб', 'времянс', 'времяработы',
 }
 
@@ -206,7 +206,7 @@ def _headers(table):
 
 
 def _counter_header(value):
-    label = _label(value)
+    label = _label(_text(value).replace('³', '3'))
     if label in COUNTER_COLUMNS:
         return True
     return any(label.endswith(unit) and label[:-len(unit)] in COUNTER_COLUMNS
