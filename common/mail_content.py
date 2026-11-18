@@ -19,24 +19,15 @@ def _is_xls(attachment):
 def attachment_name(attachment, obj):
     if _is_xls(attachment):
         return _safe_filename(attachment.filename,'.xls')
-    if attachment.sent_filename:
-        return _safe_filename(attachment.sent_filename)
-    message=attachment.message
-    subject=_line(message.subject) if message else ''
-    # Same subject-derived filename as legacy email_client.py. This text never routes mail.
-    subject=re.sub(r'\s*\(\d{2}\.\d{2}\.\d{4}\)\s*$', '', subject)
-    subject=re.sub(r'^\d{2}-\d{2}\s+', '', subject)
-    if subject:
-        if ' ул ' in subject.lower():
-            name,address=re.split(r'\s+ул\s+',subject,1,flags=re.IGNORECASE)
-            return _safe_filename(f'{name.strip()} - ул {address.strip()}')
-        if ',' in subject:
-            name,address=subject.split(',',1)
-            return _safe_filename(f'{name.strip()} - {address.strip()}')
-        if 'Распечатка:' in subject:subject=subject.split('Распечатка:',1)[1].strip()
-        return _safe_filename(subject)
-    name=_line(getattr(obj,'name',None)) or 'Документ';address=_line(getattr(obj,'address',None))
-    return _safe_filename(f'{name} - {address}' if address else name)
+    if obj is not None:
+        safe_object=re.sub(r'[^\w\s]', '', _line(obj.name) or 'Документ').strip()
+        safe_address=re.sub(r'[^\w\s.,-]', '', _line(obj.address) or 'Без адреса').strip()
+        stem=f'{safe_object} — {safe_address}'
+        if len(stem)>96:
+            stem=stem[:93]+'...'
+        return stem+'.pdf'
+    return _safe_filename(attachment.sent_filename or attachment.filename)
+
 
 def client_payload(attachment, obj):
     """Use the already verified object; freeze content in the existing delivery intent."""
