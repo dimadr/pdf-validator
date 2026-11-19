@@ -60,7 +60,8 @@ def test_one_printout_continues_on_next_page(monkeypatch, tmp_path, repeated_hea
     assert result['checked_rows'] == 4
     assert len(result['series']) == 1
     if empty_last:
-        assert any(issue['code'] == 'empty_required_measurement' for issue in result['issues'])
+        problem = next(issue for issue in result['issues'] if issue['code'] == 'empty_required_measurement')
+        assert (problem['page'], problem['printout'], problem['physical_table']) == (2, 1, 1)
 
 
 def test_separate_incomplete_printouts_cannot_fill_each_other(monkeypatch, tmp_path):
