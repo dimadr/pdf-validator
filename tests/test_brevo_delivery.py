@@ -260,3 +260,63 @@ def test_document_list_counts_delivery_and_mdn_independently_for_current_clients
         assert rows[item['attachment']]['client_delivery']['confirmation'] == {
             'confirmed': 0, 'total': 1, 'brevo_delivered': 0, 'read_confirmed': 0,
         }
+
+
+def test_case_variant_catches_up_existing_delivery_without_resending(api, tmp_path, mock_api):
+    factory = sessionmaker(bind=api.engine)
+    record = api_seed(api.engine, tmp_path, validated=True)
+    address = 'Meter.Office@example.com'
+    other = 'other@example.com'
+    ids = send(factory, record, [address, other])
+    now = utcnow()
+    historical = now - timedelta(days=1)
+    with factory.begin() as db:
+        delivery = db.get(RecipientDelivery, ids[address])
+        delivery.accepted_at = historical
+        attempt = db.scalar(select(SMTPAttempt).where(SMTPAttempt.delivery_id == ids[address]))
+        attempt.started_at = attempt.finished_at = historical
+        db.add(BrevoPollCheckpoint(smtp_attempt_id=attempt.id, next_poll_at=now))
+
+    events = [
+        event(ids[address], address.lower(), 'delivered', historical + timedelta(seconds=1)),
+        event(ids[other], 'someone@example.com', 'delivered', now),
+        event(ids[other], other, 'softBounces', now, reason='450 synthetic temporary rejection'),
+    ]
+    client = mock_api(lambda _: httpx.Response(200, json={'events': events}))
+    assert integration.poll_brevo(factory, client, now)['matched'] == 2
+
+    path = f"/api/v1/attachments/{record['attachment']}"
+    detail = api.request('GET', path)
+    assert detail.status_code == 200
+    assert detail.json()['client_delivery']['confirmation'] == {
+        'total': 2, 'confirmed': 1, 'brevo_delivered': 1, 'read_confirmed': 0,
+    }
+    history = api.request('GET', path + '/deliveries')
+    assert history.status_code == 200
+    statuses = {row['recipient']: row['delivery']['status'] for row in history.json()['items']}
+    assert statuses == {address: 'delivered', other: 'bounced'}
+    integration.poll_brevo(factory, client, now + timedelta(minutes=11))
+    with factory() as db:
+        assert db.scalar(select(func.count()).select_from(SMTPAttempt)) == 2
+        assert db.scalar(select(func.count()).select_from(BrevoDeliveryEvent)) == 2
+
+
+def test_case_variant_collision_with_not_due_attempt_is_ambiguous(session_factory, seed, mock_api):
+    first, second = 'Meter.Office@example.com', 'meter.office@example.com'
+    first_id = send(session_factory, seed(), [first])[first]
+    second_id = send(session_factory, seed(), [second])[second]
+    now = utcnow()
+    with session_factory.begin() as db:
+        for delivery_id in (first_id, second_id):
+            delivery = db.get(RecipientDelivery, delivery_id)
+            delivery.message_id = '<same-id@example.com>'
+            attempt = db.scalar(select(SMTPAttempt).where(SMTPAttempt.delivery_id == delivery_id))
+            attempt.response = '250 queued as <same-id@example.com>'
+            if delivery_id == second_id:
+                db.add(BrevoPollCheckpoint(smtp_attempt_id=attempt.id, next_poll_at=now + timedelta(hours=1)))
+    client = mock_api(lambda _: pytest.fail('Ambiguous identifier must not reach API'))
+    assert integration.poll_brevo(session_factory, client, now)['requests'] == 0
+    with session_factory() as db:
+        assert list(db.scalars(select(BrevoPollCheckpoint.last_error).where(
+            BrevoPollCheckpoint.last_error.is_not(None)))) == ['ambiguous_identifier']
+        assert db.scalar(select(func.count()).select_from(BrevoDeliveryEvent)) == 0

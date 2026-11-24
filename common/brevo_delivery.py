@@ -43,7 +43,9 @@ def canonical_id(value):
 
 
 def recipient_key(value):
-    return canonical_id(value) if isinstance(value, str) and '<' not in value else None
+    address = canonical_id(value) if isinstance(value, str) and '<' not in value else None
+    # Brevo can report different casing from the original SMTP envelope.
+    return address.lower() if address and address.isascii() else address
 
 
 def load_api_key():
@@ -138,7 +140,12 @@ def _targets(db, cutoff):
 
     identities = {}
     targets = {}
-    for attempt, delivery in db.execute(base.where(RecipientDelivery.recipient.in_({d.recipient for _, d in due}))):
+    recipients = {d.recipient for _, d in due}
+    ascii_recipients = {recipient.lower() for recipient in recipients if recipient.isascii()}
+    # Include historical collisions even when the other attempt is not due.
+    same_recipient = or_(RecipientDelivery.recipient.in_(recipients),
+                         func.lower(RecipientDelivery.recipient.collate('C')).in_(ascii_recipients))
+    for attempt, delivery in db.execute(base.where(same_recipient)):
         ack = ACK_ID.search(attempt.response or '')
         identifiers = tuple(dict.fromkeys(filter(None, (canonical_id(ack[1]) if ack else None,
                                                        canonical_id(delivery.message_id)))))
