@@ -14,13 +14,13 @@ from common.models import Attachment, BrevoDeliveryEvent, BrevoPollCheckpoint, P
 from test_api_rc import api, api_databases, seed as api_seed
 
 
-def test_brevo_is_polled_hourly_without_slowing_imap(monkeypatch):
+def test_brevo_is_polled_every_five_minutes_without_slowing_imap(monkeypatch):
     monkeypatch.setenv('DATABASE_URL', 'sqlite://')
     monkeypatch.setenv('REDIS_URL', 'memory://')
     from worker.celery_app import celery_app
 
     schedule = celery_app.conf.beat_schedule
-    assert schedule['brevo-delivery-events'] == {'task': 'pipeline.poll_brevo_events', 'schedule': 3600.0}
+    assert schedule['brevo-delivery-events'] == {'task': 'pipeline.poll_brevo_events', 'schedule': 300.0}
     assert schedule['fetch-emails-every-2-minutes']['schedule'] == 120.0
 
 
@@ -84,13 +84,14 @@ def test_exact_provider_identity_per_recipient_and_mdn_independent(session_facto
     requests = []
     def handler(request):
         params = request.url.params
-        requests.append((params['messageId'], params['email']))
+        requests.append(params['startDate'])
         assert request.method == 'GET' and str(request.url).startswith(integration.EVENTS_URL)
-        return httpx.Response(200, json={'events': pages[params['messageId']]})
+        assert 'messageId' not in params and 'email' not in params
+        return httpx.Response(200, json={'events': [item for page in pages.values() for item in page]})
     client = mock_api(handler)
     result = integration.poll_brevo(session_factory, client, now)
-    assert (result['requests'], result['matched'], result['unmatched']) == (3, 4, 1)
-    assert set(requests) == {(provider_id(ids[alice]), alice), (provider_id(ids[bob]), bob), (provider_id(other), alice)}
+    assert (result['requests'], result['matched'], result['unmatched']) == (1, 4, 1)
+    assert requests == [(now.date() - timedelta(days=1)).isoformat()]
     integration.poll_brevo(session_factory, client, now+timedelta(minutes=31))
 
     with session_factory() as db:
@@ -137,6 +138,7 @@ def test_ambiguous_ids_never_promote_delivery(session_factory, seed, mock_api):
 
 def test_checkpoint_resumes_pagination_across_invocations(session_factory, seed, monkeypatch, mock_api):
     monkeypatch.setattr(integration, 'PAGE_SIZE', 2)
+    monkeypatch.setattr(integration, 'MAX_REQUESTS', 1)
     address = 'page@example.com'
     record = seed()
     delivery_id = send(session_factory, record, [address])[address]
@@ -150,25 +152,29 @@ def test_checkpoint_resumes_pagination_across_invocations(session_factory, seed,
         offsets.append(offset)
         dates.append(request.url.params['endDate'])
         return httpx.Response(200, json={'events': pages[offset]})
-    integration.poll_brevo(session_factory, mock_api(handler), now)
-    integration.poll_brevo(session_factory, mock_api(handler), now+timedelta(minutes=11))
+    assert integration.poll_brevo(session_factory, mock_api(handler), now)['state'] == 'partial'
+    assert integration.poll_brevo(session_factory, mock_api(handler), now+timedelta(minutes=5))['state'] == 'ok'
     assert offsets == [0, 2] and dates[0] == dates[1]
     with session_factory() as db:
         assert db.scalar(select(BrevoPollCheckpoint.page_offset)) == 0
         assert delivery_page(db, record['attachment'])['items'][0]['delivery']['status'] == 'delivered'
 
 
-def test_poll_budget_services_remaining_sends_on_next_tick(session_factory, seed, monkeypatch, mock_api):
-    monkeypatch.setattr(integration, 'MAX_REQUESTS', 2)
-    send(session_factory, seed(), ['a@example.com', 'b@example.com', 'c@example.com'])
+def test_batch_catches_up_mass_sends_and_leaves_no_event_unknown(session_factory, seed, mock_api):
+    record = seed()
+    addresses = [f'bulk-{i}@example.com' for i in range(36)]
+    deliveries = send(session_factory, record, addresses)
     now = utcnow()
-    recipients = []
-    def handler(request):
-        recipients.append(request.url.params['email'])
-        return httpx.Response(200, json={'events': []})
-    assert integration.poll_brevo(session_factory, mock_api(handler), now)['requests'] == 2
-    assert integration.poll_brevo(session_factory, mock_api(handler), now+timedelta(minutes=10))['requests'] == 1
-    assert set(recipients) == {'a@example.com', 'b@example.com', 'c@example.com'}
+    events = [event(deliveries[address], address, 'delivered', now) for address in addresses[:-2]]
+    events.append(event(deliveries[addresses[-2]], addresses[-2], 'deferred', now))
+    result = integration.poll_brevo(session_factory, mock_api(lambda _: httpx.Response(200, json={'events': events})), now)
+    assert (result['requests'], result['matched']) == (1, 35)
+    with session_factory() as db:
+        statuses = {row['recipient']: row['delivery']['status']
+                    for row in delivery_page(db, record['attachment'])['items']}
+        assert list(statuses.values()).count('delivered') == 34
+        assert statuses[addresses[-2]] == 'deferred' and statuses[addresses[-1]] == 'unknown'
+        assert db.scalar(select(func.count()).select_from(SMTPAttempt)) == len(addresses)
 
 
 @pytest.mark.parametrize('failure', [429, 503, 'timeout'])
@@ -188,7 +194,7 @@ def test_api_failure_persists_backoff_and_never_retries_smtp(session_factory, se
     send(session_factory, seed(), [address])
     with session_factory() as db:
         assert db.scalar(select(func.count()).select_from(SMTPAttempt)) == 2
-        assert db.scalar(select(BrevoPollCheckpoint.page_offset)) == 0
+        assert db.scalar(select(BrevoPollCheckpoint.page_offset)) is None
         assert not db.scalar(select(BrevoDeliveryEvent.event_key))
 
 
@@ -230,7 +236,7 @@ def test_document_list_counts_delivery_and_mdn_independently_for_current_clients
              provider_id(opened_ids[alice]): [event(opened_ids[alice], alice, 'opened', now)],
              provider_id(partial_ids[alice]): [event(partial_ids[alice], alice, 'delivered', now)],
              provider_id(partial_ids[bob]): [event(partial_ids[bob], bob, 'opened', now)]}
-    client = mock_api(lambda request: httpx.Response(200, json={'events': pages[request.url.params['messageId']]}))
+    client = mock_api(lambda _: httpx.Response(200, json={'events': [item for page in pages.values() for item in page]}))
     integration.poll_brevo(factory, client, now)
 
     def documents():

@@ -5,7 +5,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from uuid import UUID
@@ -16,11 +16,12 @@ from sqlalchemy.dialects.postgresql import insert
 from common.models import BrevoDeliveryEvent, BrevoPollCheckpoint, RecipientDelivery, Setting, SMTPAttempt, utcnow
 
 EVENTS_URL = 'https://api.brevo.com/v3/smtp/statistics/events'
-PAGE_SIZE = 100
-MAX_REQUESTS = 24
+PAGE_SIZE = 1000
+MAX_REQUESTS = 6
 LOOKBACK = timedelta(days=30)
 POLL_LOCK = 703271189042
 BACKOFF_KEY = 'brevo_events_backoff'
+SCAN_KEY = 'brevo_events_scan_v2'
 FINAL_EVENTS = {'delivered': 'delivered', 'hardbounce': 'bounced', 'softbounce': 'bounced',
                 'hardbounces': 'bounced', 'softbounces': 'bounced',
                 'blocked': 'blocked', 'invalid': 'failed', 'error': 'failed', 'failed': 'failed'}
@@ -83,18 +84,17 @@ class BrevoEventsClient:
         self.httpx = httpx
         self.key = key
         self.http = httpx.Client(headers={'api-key': key, 'Accept': 'application/json'},
-                                 timeout=httpx.Timeout(3, connect=2), transport=transport,
+                                 timeout=httpx.Timeout(5, connect=3), transport=transport,
                                  follow_redirects=False, trust_env=False)
 
     def close(self):
         self.http.close()
 
-    def page(self, identifier, recipient, start, end, offset):
+    def page(self, start, end, offset):
         try:
             response = self.http.get(EVENTS_URL, params={
-                'messageId': f'<{identifier}>', 'email': recipient,
                 'startDate': start.isoformat(), 'endDate': end.isoformat(),
-                'sort': 'asc', 'offset': offset, 'limit': PAGE_SIZE,
+                'sort': 'desc', 'offset': offset, 'limit': PAGE_SIZE,
             })
         except self.httpx.TimeoutException:
             raise BrevoUnavailable('timeout') from None
@@ -107,7 +107,7 @@ class BrevoEventsClient:
                 delay = 3600
             raise BrevoUnavailable(f'http_{code}', delay)
         try:
-            if len(response.content) > 1_000_000 or self.key in response.text:
+            if len(response.content) > 2_000_000 or self.key in response.text:
                 raise ValueError
             rows = response.json().get('events', [])
             if not isinstance(rows, list) or len(rows) > PAGE_SIZE:
@@ -125,15 +125,14 @@ class Target:
     started_at: datetime
 
 
-def _targets(db, now):
+def _targets(db, cutoff):
     base = select(SMTPAttempt, RecipientDelivery).join(RecipientDelivery, SMTPAttempt.delivery_id == RecipientDelivery.id)
     base = base.where(SMTPAttempt.provider == 'brevo', SMTPAttempt.state == 'accepted',
                       RecipientDelivery.smtp_provider == 'brevo', RecipientDelivery.state == 'accepted')
     due = db.execute(base.outerjoin(BrevoPollCheckpoint, SMTPAttempt.id == BrevoPollCheckpoint.smtp_attempt_id)
-        .where(SMTPAttempt.started_at >= now - LOOKBACK,
-               or_(BrevoPollCheckpoint.next_poll_at.is_(None), BrevoPollCheckpoint.next_poll_at <= now))
-        .order_by(func.coalesce(BrevoPollCheckpoint.next_poll_at, SMTPAttempt.started_at), SMTPAttempt.id)
-        .limit(MAX_REQUESTS)).all()
+        .where(SMTPAttempt.started_at >= cutoff - LOOKBACK,
+               func.coalesce(RecipientDelivery.accepted_at, SMTPAttempt.finished_at, SMTPAttempt.started_at) <= cutoff,
+               or_(BrevoPollCheckpoint.next_poll_at.is_(None), BrevoPollCheckpoint.next_poll_at <= cutoff))).all()
     if not due:
         return [], {}
 
@@ -201,6 +200,39 @@ def _backoff(db):
     return None, 0
 
 
+def _save_setting(db, key, value):
+    serialized = json.dumps(value, default=lambda dt: dt.isoformat())
+    db.execute(insert(Setting).values(key=key, value=serialized)
+               .on_conflict_do_update(index_elements=[Setting.key], set_={'value': serialized}))
+
+
+def _scan(db, now):
+    raw = db.scalar(select(Setting.value).where(Setting.key == SCAN_KEY))
+    if raw:
+        try:
+            state = json.loads(raw)
+            cutoff = _event_date(state['cutoff'])
+            offset = int(state['offset'])
+            if cutoff and now - timedelta(hours=6) <= cutoff <= now and offset > 0:
+                return cutoff, date.fromisoformat(state['start']), offset
+        except (TypeError, ValueError, KeyError):
+            pass
+    return now, None, 0
+
+
+def _checkpoints(db, updates, now):
+    rows = [dict(smtp_attempt_id=attempt_id, last_error=error, page_offset=0, window_end=None,
+                 next_poll_at=now + (timedelta(hours=6) if error else timedelta(minutes=10)),
+                 last_polled_at=None if error else now) for attempt_id, error in updates]
+    for index in range(0, len(rows), 500):
+        stmt = insert(BrevoPollCheckpoint).values(rows[index:index + 500])
+        db.execute(stmt.on_conflict_do_update(index_elements=[BrevoPollCheckpoint.smtp_attempt_id], set_={
+            'next_poll_at': stmt.excluded.next_poll_at, 'last_error': stmt.excluded.last_error,
+            'last_polled_at': func.coalesce(stmt.excluded.last_polled_at, BrevoPollCheckpoint.last_polled_at),
+            'page_offset': 0, 'window_end': None,
+        }))
+
+
 def poll_brevo(factory, client, now=None):
     now = now or utcnow()
     deadline = time.monotonic() + 8
@@ -212,47 +244,57 @@ def poll_brevo(factory, client, now=None):
         until, failures = _backoff(guard)
         if until and until > now:
             return {'state': 'backoff', 'until': until.isoformat()}
-        targets, identities = _targets(guard, now)
-        for target in targets:
+        cutoff, start, offset = _scan(guard, now)
+        targets, identities = _targets(guard, cutoff)
+        unique = {target.attempt_id: target for target in targets
+                  if any(identities[(target.recipient, mid)] == {target.attempt_id} for mid in target.identifiers)}
+        with factory.begin() as db:
+            _checkpoints(db, ((target.attempt_id, 'ambiguous_identifier' if target.identifiers else 'missing_identifier')
+                              for target in targets if target.attempt_id not in unique), now)
+            if not unique:
+                row = db.scalar(select(Setting).where(Setting.key == SCAN_KEY))
+                if row:
+                    db.delete(row)
+                return report
+        # Overlap the preceding calendar day for provider date filters. The
+        # exact timestamp and the (recipient, message ID) match stay mandatory.
+        start = start or (min(target.started_at for target in unique.values()).date() - timedelta(days=1))
+        end = cutoff.date()
+        for _ in range(MAX_REQUESTS):
             if time.monotonic() >= deadline:
                 break
+            report['requests'] += 1
+            try:
+                events = client.page(start, end, offset)
+            except BrevoUnavailable as error:
+                delay = max(error.retry_after, min(3600, 300 * 2 ** min(failures, 4)))
+                with factory.begin() as db:
+                    _save_setting(db, BACKOFF_KEY, {'until': now + timedelta(seconds=delay), 'failures': failures+1})
+                report.update(state='backoff', reason=error.code)
+                return report
+            full = len(events) == PAGE_SIZE
             with factory.begin() as db:
-                cursor = db.get(BrevoPollCheckpoint, target.attempt_id)
-                if cursor is None:
-                    cursor = BrevoPollCheckpoint(smtp_attempt_id=target.attempt_id, next_poll_at=now, page_offset=0)
-                    db.add(cursor)
-                known = [mid for mid in target.identifiers if identities[(target.recipient, mid)] == {target.attempt_id}]
-                if not known:
-                    cursor.next_poll_at = now + timedelta(hours=6)
-                    cursor.last_error = 'ambiguous_identifier' if target.identifiers else 'missing_identifier'
-                    continue
-                end = cursor.window_end or now
-                report['requests'] += 1
-                try:
-                    events = client.page(known[0], target.recipient, target.started_at.date(), end.date(), cursor.page_offset)
-                except BrevoUnavailable as error:
-                    delay = max(error.retry_after, min(3600, 600 * 2 ** min(failures, 3)))
-                    values = json.dumps({'until': (now + timedelta(seconds=delay)).isoformat(), 'failures': failures+1})
-                    db.execute(insert(Setting).values(key=BACKOFF_KEY, value=values)
-                               .on_conflict_do_update(index_elements=[Setting.key], set_={'value': values}))
-                    cursor.last_error = error.code
-                    report.update(state='backoff', reason=error.code)
-                    return report
-                unmatched = 0
                 for event in events:
-                    if _store_event(db, event, target, identities, now) is None:
-                        unmatched += 1
-                report['unmatched'] += unmatched
-                report['matched'] += len(events) - unmatched
-                full = len(events) == PAGE_SIZE
-                cursor.last_error = 'unmatched_event' if unmatched else None
-                cursor.last_polled_at = now
-                cursor.page_offset = cursor.page_offset + PAGE_SIZE if full else 0
-                cursor.window_end = end if full else None
-                cursor.next_poll_at = now + timedelta(minutes=10 if full else 30)
+                    key = (recipient_key(event.get('email')), canonical_id(event.get('messageId'))) if isinstance(event, dict) else None
+                    owners = identities.get(key, ())
+                    target = unique.get(next(iter(owners))) if len(owners) == 1 else None
+                    if target and _store_event(db, event, target, identities, now) is not None:
+                        report['matched'] += 1
+                    else:
+                        report['unmatched'] += 1
                 if failures:
                     row = db.scalar(select(Setting).where(Setting.key == BACKOFF_KEY))
                     if row:
                         db.delete(row)
                     failures = 0
+                if full:
+                    offset += PAGE_SIZE
+                    _save_setting(db, SCAN_KEY, {'cutoff': cutoff, 'start': start, 'offset': offset})
+                else:
+                    row = db.scalar(select(Setting).where(Setting.key == SCAN_KEY))
+                    if row:
+                        db.delete(row)
+                    _checkpoints(db, ((attempt_id, None) for attempt_id in unique), now)
+                    return report
+        report['state'] = 'partial'
     return report
