@@ -2,6 +2,7 @@ services:
   worker:
     environment:
       BREVO_API_KEY_FILE: /run/secrets/brevo_api_key
+      BREVO_DELIVERY_ALERTS_SINCE: "${BREVO_DELIVERY_ALERTS_SINCE:-}"
     volumes:
       - type: bind
         source: /root/project1-next/deploy/secrets/brevo-api-key

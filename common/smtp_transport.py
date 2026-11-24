@@ -31,12 +31,15 @@ class SMTPTransport:
             raise DefinitiveFailure('SMTP test mode requires an isolated local sink',False,'smtp_config')
         message=EmailMessage();message['From']=cfg['sender'];message['To']=work['recipient']
         message['Reply-To']=cfg['reply_to'];message['Date']=work['date'];message['Message-ID']=work['message_id']
-        message['Disposition-Notification-To']=cfg['sender'];message['X-Priority']='3'
+        if work['content'] is not None:
+            message['Disposition-Notification-To']=cfg['sender']
+        message['X-Priority']='3'
         message['Subject']=work['payload'].get('subject','PDF report')
         message.set_content(work['payload'].get('body','PDF report attached'))
-        filename=work['payload'].get('filename','report.pdf')
-        subtype='vnd.ms-excel' if isinstance(filename,str) and filename.lower().endswith('.xls') else 'pdf'
-        message.add_attachment(work['content'],maintype='application',subtype=subtype,filename=filename)
+        if work['content'] is not None:
+            filename=work['payload'].get('filename','report.pdf')
+            subtype='vnd.ms-excel' if isinstance(filename,str) and filename.lower().endswith('.xls') else 'pdf'
+            message.add_attachment(work['content'],maintype='application',subtype=subtype,filename=filename)
         server=None;submission_started=False
         try:
             context=ssl.create_default_context()

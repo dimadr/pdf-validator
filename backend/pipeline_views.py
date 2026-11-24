@@ -7,7 +7,7 @@ from pathlib import Path
 from uuid import UUID
 
 from sqlalchemy import select, func
-from common.brevo_delivery import FINAL_EVENTS
+from common.brevo_outcomes import outcome, reply_codes
 from common.models import Attachment, BrevoDeliveryEvent, MailboxAction, ProcessingRevision, DeliveryIntent, RecipientDelivery, Object, SMTPAttempt
 from common.delivery_status import client_delivery
 
@@ -95,13 +95,14 @@ def _read_confirmations(db, attachment_id, deliveries):
 
 
 def _delivery_summary(events):
-    observations = [event for event in events if event.processing_state == 'delivery']
-    finals = [event for event in observations if event.event_type in FINAL_EVENTS]
-    # A delayed transient notification cannot undo an observed final outcome.
-    latest = max(finals or observations, key=lambda e: (e.occurred_at, e.event_type != 'delivered', e.event_key), default=None)
+    status, current, problem = outcome(events)
     opens = [event.occurred_at for event in events if event.processing_state == 'open_signal']
-    return {'status': FINAL_EVENTS.get(latest.event_type, 'deferred') if latest else 'unknown',
-            'at': latest.occurred_at if latest else None, 'reason': latest.reason if latest else None,
+    code, enhanced = reply_codes(problem.reason if problem else None)
+    return {'status': status, 'at': current.occurred_at if current else None,
+            'reason': current.reason if current else None,
+            'smtp_code': code, 'smtp_enhanced_code': enhanced,
+            'recovered': status == 'delivered' and problem is not None,
+            'previous_problem': problem.reason if status == 'delivered' and problem else None,
             'opened_at': max(opens, default=None), 'event_count': len(events)}
 
 
@@ -167,6 +168,7 @@ def delivery_event_page(db, attachment_id, delivery_id, skip, limit):
                       .offset(skip).limit(limit))
     items = [{'at': event.occurred_at, 'provider': 'brevo', 'recipient': recipient, 'message_id': message_id,
               'provider_message_id': event.provider_message_id, 'smtp_attempt': attempt, 'event': event.event_type,
-              'processing_state': event.processing_state, 'reason': event.reason}
+              'processing_state': event.processing_state, 'reason': event.reason,
+              'smtp_code': reply_codes(event.reason)[0], 'smtp_enhanced_code': reply_codes(event.reason)[1]}
              for event, attempt, recipient, message_id in rows]
     return {'items': items, 'total': total, 'skip': skip, 'limit': limit}

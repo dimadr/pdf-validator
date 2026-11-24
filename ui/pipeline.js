@@ -91,14 +91,19 @@ globalThis.PipelineUI = class PipelineUI {
         const escape = value => this.admin.escapeHtml(value);
         const labels = {pending:'Ожидает',in_flight:'Выполняется',accepted:'Принято SMTP',
             failed:'Отказ',uncertain:'Результат неизвестен',cancelled:'Отменено'};
-        const deliveryLabels = {delivered:'Доставлено на почтовый сервер',deferred:'Задержано',
-            bounced:'Возврат',blocked:'Заблокировано',failed:'Ошибка доставки',unknown:'Нет данных о доставке'};
+        const deliveryLabels = {delivered:'Доставлено на почтовый сервер',deferred:'Временная проблема доставки',
+            bounced:'Окончательная недоставка',blocked:'Окончательная недоставка: заблокировано',
+            failed:'Окончательная недоставка: ошибка',unknown:'Нет данных о доставке'};
+        const deliveryLabel = row => row.delivery?.recovered
+            ? 'Доставлено после проблемы'
+            : (deliveryLabels[row.delivery?.status] || deliveryLabels.unknown);
         const rows = page.items.map(row => `<tr><td>${this.admin.compactValue(row.recipient, 'Адрес получателя')}</td>` +
             `<td>${row.role === 'client' ? 'Клиент' : 'Администратор'}</td>` +
             `<td>${escape(labels[row.state] || row.state)}</td>` +
             `<td>${row.read_confirmed_at && (!row.delivery?.status || row.delivery.status === 'unknown')
-                ? 'Доставка подтверждена по MDN' : escape(deliveryLabels[row.delivery?.status] || deliveryLabels.unknown)}` +
-            (row.delivery?.reason ? `<br>${this.admin.compactValue(row.delivery.reason, 'Причина доставки')}` : '') +
+                ? 'Доставка подтверждена по MDN' : escape(deliveryLabel(row))}` +
+            (row.delivery?.reason ? `<br>Ответ SMTP: ${this.admin.compactValue(row.delivery.reason, 'Причина отказа')}` : '') +
+            (row.delivery?.previous_problem ? `<br>Предыдущий отказ: ${this.admin.compactValue(row.delivery.previous_problem, 'Ответ SMTP')}` : '') +
             (row.delivery?.opened_at ? `<br><small>Сигнал открытия Brevo ${escape(this.admin.formatTime(row.delivery.opened_at))}</small>` : '') +
             (this.admin.currentUser?.role === 'admin' && row.delivery?.event_count > 0 ?
                 `<br><button type="button" class="btn btn-sm btn-outline-secondary js-brevo-events" data-delivery-id="${escape(row.id)}" data-offset="0">События (${escape(row.delivery.event_count)})</button>` : '') +

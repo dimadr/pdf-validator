@@ -243,3 +243,24 @@ test('SMTP card uses current client acceptance, never the legacy sent aggregate'
     assert.equal(node('sent-attachments').textContent,2);
     assert.ok(fs.readFileSync(path.join(root,'ui/index.html'),'utf8').includes('>Принято SMTP</h5>'));
 });
+
+test('dispatch history shows temporary failure, final failure and subsequent delivery', async () => {
+    const {admin} = fixture();
+    const reason = '450 4.1.8 <sender@example.invalid> rejected';
+    admin.apiCall = async () => ({total:3,items:[
+        {recipient:'temporary@example.invalid',role:'client',state:'accepted',attempts:1,
+         delivery:{status:'deferred',reason}},
+        {recipient:'final@example.invalid',role:'client',state:'accepted',attempts:1,
+         delivery:{status:'bounced',reason:'550 5.1.1 Mailbox unavailable'}},
+        {recipient:'success@example.invalid',role:'client',state:'accepted',attempts:1,
+         delivery:{status:'delivered',recovered:true,previous_problem:reason}},
+    ]});
+    const html = await admin.pipeline.historyHTML('fixture');
+    assert.match(html,/Временная проблема доставки/);
+    assert.match(html,/Окончательная недоставка/);
+    assert.match(html,/Доставлено после проблемы/);
+    assert.match(html,/Ответ SMTP/);
+    assert.match(html,/Предыдущий отказ/);
+    assert.match(html,/450 4\.1\.8 &lt;sender@example\.invalid&gt;/);
+    assert.doesNotMatch(html,/<sender@example\.invalid>/);
+});

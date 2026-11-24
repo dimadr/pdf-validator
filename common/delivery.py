@@ -33,6 +33,10 @@ def normalized(address):
     # Do not case-fold a possibly case-sensitive local part.
     return local+'@'+domain.lower()
 
+DELIVERY_TASK = 'pipeline.deliver_recipient'
+DISPATCHER_ALERT_TASK = 'pipeline.deliver_dispatcher_alert'
+
+
 def enqueue(db,topic,payload,available_at=None):
     event=OutboxEvent(id=uuid.uuid4(),topic=topic,payload=payload,available_at=available_at or now(),attempts=0)
     db.add(event)
@@ -70,7 +74,8 @@ def plan_intent(db,revision,recipients,request_key,kind='automatic',payload=None
             state='pending',attempts=0,message_id='<'+str(delivery_id)+'@'+os.getenv('MESSAGE_ID_DOMAIN','processor.invalid')+'>',
             mime_date=format_datetime(now()))
         db.add(delivery)
-        enqueue(db,'pipeline.deliver_recipient',{'delivery_id':str(delivery_id)})
+        enqueue(db,DISPATCHER_ALERT_TASK if _is_delivery_alert(intent, delivery) else DELIVERY_TASK,
+                {'delivery_id':str(delivery_id)})
     return intent
 
 def dispatch_outbox(session_factory,publish,limit=100,after_publish=None):
@@ -112,7 +117,12 @@ def _route_error(db,attachment,revision,obj,role):
     if role=='client' and (revision.state!='validated' or obj is None):return 'client_route_not_validated'
     if role=='client' and not object_binding_matches(db,obj,revision):return 'object_binding_changed'
 
-def _claim(session_factory,delivery_id,owner,lease_seconds,max_attempts):
+def _is_delivery_alert(intent, delivery):
+    return (intent.kind == 'admin_notification' and delivery.role == 'admin'
+            and isinstance(intent.payload.get('delivery_problem'), dict))
+
+
+def _claim(session_factory,delivery_id,owner,lease_seconds,max_attempts,dispatcher_alert=False):
     with session_factory() as db:
         with db.begin():
             parent=db.execute(select(ProcessingRevision.attachment_id).join(DeliveryIntent,DeliveryIntent.revision_id==ProcessingRevision.id)
@@ -121,7 +131,10 @@ def _claim(session_factory,delivery_id,owner,lease_seconds,max_attempts):
             attachment=db.scalar(select(Attachment).where(Attachment.id==parent).with_for_update())
             delivery=db.scalar(select(RecipientDelivery).where(RecipientDelivery.id==delivery_id).with_for_update())
             intent=db.get(DeliveryIntent,delivery.intent_id);revision=db.get(ProcessingRevision,intent.revision_id)
-            if attachment.status=='archived':
+            alert = _is_delivery_alert(intent, delivery)
+            if alert != dispatcher_alert:
+                return None
+            if not alert and attachment.status=='archived':
                 if delivery.state in ('pending','failed'):
                     delivery.state='cancelled';delivery.error_code='attachment_archived';delivery.retry_at=None
                 return None
@@ -129,10 +142,10 @@ def _claim(session_factory,delivery_id,owner,lease_seconds,max_attempts):
             if delivery.state=='failed' and delivery.retry_at is None:return None
             due=delivery.retry_at
             if due is not None and (due if due.tzinfo else due.replace(tzinfo=timezone.utc)) > now():return None
-            if attachment.current_revision_id!=revision.id or revision.state in ('received','extracting','technical_error','discarded_inactive'):
+            if not alert and (attachment.current_revision_id!=revision.id or revision.state in ('received','extracting','technical_error','discarded_inactive')):
                 delivery.state='cancelled';delivery.error_code='stale_or_unavailable_revision';return None
             obj=db.scalar(select(Object).where(Object.id==revision.object_id).with_for_update()) if revision.object_id else None
-            if _inactive_blocks_delivery(revision,obj,delivery.role):
+            if not alert and _inactive_blocks_delivery(revision,obj,delivery.role):
                 delivery.state='cancelled';delivery.error_code='object_inactive';return None
             if delivery.role=='client' and (revision.state!='validated' or obj is None):
                 delivery.state='cancelled';delivery.error_code='client_route_not_validated';return None
@@ -148,7 +161,7 @@ def _claim(session_factory,delivery_id,owner,lease_seconds,max_attempts):
             if provider=='brevo' and quota_used(db)>=quota_limit():
                 delivery.retry_at=now()+timedelta(minutes=15)
                 delivery.error_code='smtp_quota';delivery.error='Brevo local rolling 24h limit reached; retained for retry'
-                enqueue(db,'pipeline.deliver_recipient',{'delivery_id':str(delivery.id)},delivery.retry_at)
+                enqueue(db,DISPATCHER_ALERT_TASK if alert else DELIVERY_TASK,{'delivery_id':str(delivery.id)},delivery.retry_at)
                 return None
             delivery.state='in_flight';delivery.owner=owner;delivery.lease_until=now()+timedelta(seconds=lease_seconds)
             delivery.attempts+=1;delivery.error=None;delivery.error_code=None
@@ -156,7 +169,7 @@ def _claim(session_factory,delivery_id,owner,lease_seconds,max_attempts):
             attempt_id=uuid.uuid4()
             db.add(SMTPAttempt(id=attempt_id,delivery_id=delivery.id,attempt=delivery.attempts,provider=provider,state='in_flight'))
             return {'id':delivery.id,'owner':owner,'recipient':delivery.recipient,'message_id':delivery.message_id,
-                'date':delivery.mime_date,'path':revision.file_path,'sha256':revision.content_sha256,'payload':dict(intent.payload),'attempt':delivery.attempts,
+                'date':delivery.mime_date,'path':revision.file_path,'alert':alert,'sha256':revision.content_sha256,'payload':dict(intent.payload),'attempt':delivery.attempts,
                 'provider':provider,'attempt_id':attempt_id,
                 'ai_generation':ai.get('generation') if delivery.role=='client' and ai.get('state')=='used' else None}
 
@@ -173,9 +186,9 @@ def _uncertain(session_factory,work,reason,response_code=None,response=None):
         # A failed database cannot record certainty. Lease reconciliation is the durable fallback.
         pass
 
-def deliver_recipient(session_factory,delivery_id,smtp_transport,owner=None,lease_seconds=120,max_attempts=3,before_result_commit=None,before_smtp=None):
+def deliver_recipient(session_factory,delivery_id,smtp_transport,owner=None,lease_seconds=120,max_attempts=3,before_result_commit=None,before_smtp=None,*,dispatcher_alert=False):
     owner=str(owner or uuid.uuid4())
-    work=_claim(session_factory,delivery_id,owner,lease_seconds,max_attempts)
+    work=_claim(session_factory,delivery_id,owner,lease_seconds,max_attempts,dispatcher_alert)
     if work is None:return {'state':'skipped'}
     state,error,code,retryable='accepted',None,None,False
     response_code,response=None,None
@@ -188,10 +201,11 @@ def deliver_recipient(session_factory,delivery_id,smtp_transport,owner=None,leas
                     .join(RecipientDelivery,RecipientDelivery.intent_id==DeliveryIntent.id).where(RecipientDelivery.id==work['id'])).scalar_one()
                 attachment=fence.scalar(select(Attachment).where(Attachment.id==parent).with_for_update())
                 current=fence.scalar(select(RecipientDelivery).where(RecipientDelivery.id==work['id']).with_for_update())
-                revision=fence.get(ProcessingRevision,fence.get(DeliveryIntent,current.intent_id).revision_id)
+                intent=fence.get(DeliveryIntent,current.intent_id)
+                revision=fence.get(ProcessingRevision,intent.revision_id)
                 obj=fence.scalar(select(Object).where(Object.id==revision.object_id).with_for_update()) if revision.object_id else None
                 if current.state!='in_flight' or current.owner!=work['owner']:return {'state':'skipped','reason':'claim_expired_before_smtp'}
-                route_error=_route_error(fence,attachment,revision,obj,current.role)
+                route_error=None if _is_delivery_alert(intent,current) else _route_error(fence,attachment,revision,obj,current.role)
                 if route_error:
                     current.state='cancelled';current.error_code=route_error;current.lease_until=None;current.retry_at=None
                     fence.execute(update(SMTPAttempt).where(SMTPAttempt.id==work['attempt_id']).values(state='failed',error_code=route_error,finished_at=now()))
@@ -209,12 +223,14 @@ def deliver_recipient(session_factory,delivery_id,smtp_transport,owner=None,leas
                     .values(lease_until=now()+timedelta(seconds=lease_seconds))).rowcount
                 if valid!=1:return {'state':'skipped','reason':'claim_expired_before_smtp'}
         # Verify the immutable bytes used for this processing revision before every external effect.
-        import pathlib
-        path=pathlib.Path(work['path'] or '')
-        content=path.read_bytes() if path.is_file() else None
-        if content is None or hashlib.sha256(content).hexdigest()!=work['sha256']:
-            raise DefinitiveFailure('Content missing or integrity check failed',False,'content_integrity')
-        work['content']=content
+        work['content']=None
+        if not work['alert']:
+            import pathlib
+            path=pathlib.Path(work['path'] or '')
+            content=path.read_bytes() if path.is_file() else None
+            if content is None or hashlib.sha256(content).hexdigest()!=work['sha256']:
+                raise DefinitiveFailure('Content missing or integrity check failed',False,'content_integrity')
+            work['content']=content
         result=smtp_transport.send(work) or {}
         response_code,response=result.get('code'),result.get('response')
     except DefinitiveFailure as exc:
@@ -237,7 +253,8 @@ def deliver_recipient(session_factory,delivery_id,smtp_transport,owner=None,leas
                 if state=='accepted':delivery.accepted_at=now()
                 if state=='failed' and retryable and (delivery.attempts<max_attempts or code=='smtp_quota'):
                     delivery.retry_at=now()+timedelta(seconds=900 if code=='smtp_quota' else 60*2**min(delivery.attempts-1,6))
-                    enqueue(db,'pipeline.deliver_recipient',{'delivery_id':str(delivery.id)},delivery.retry_at)
+                    enqueue(db,DISPATCHER_ALERT_TASK if work['alert'] else DELIVERY_TASK,
+                            {'delivery_id':str(delivery.id)},delivery.retry_at)
                 if before_result_commit:before_result_commit(db)
     except Exception:
         _uncertain(session_factory,work,'SMTP attempt finished but PostgreSQL result commit failed',response_code,response)
@@ -268,7 +285,7 @@ def reconcile(session_factory):
             stale=db.scalars(select(OutboxEvent).where(OutboxEvent.published_at<now()-timedelta(minutes=5)).with_for_update(skip_locked=True)).all()
             reset=0
             for event in stale:
-                if event.topic=='pipeline.deliver_recipient':
+                if event.topic in (DELIVERY_TASK, DISPATCHER_ALERT_TASK):
                     item=db.get(RecipientDelivery,uuid.UUID(event.payload['delivery_id']))
                     eligible=item is not None and (item.state=='pending' or item.state=='failed' and item.retry_at is not None) and (item.attempts<3 or item.error_code=='smtp_quota')
                 elif event.topic=='pipeline.validate_revision':
@@ -279,8 +296,8 @@ def reconcile(session_factory):
                     eligible=item is not None and item.state=='discarded_inactive' and not (item.validation_result or {}).get('content_deleted')
                 else:eligible=False
                 if eligible:
-                    revision=item if event.topic!='pipeline.deliver_recipient' else db.get(ProcessingRevision,db.get(DeliveryIntent,item.intent_id).revision_id)
+                    revision=item if event.topic not in (DELIVERY_TASK, DISPATCHER_ALERT_TASK) else db.get(ProcessingRevision,db.get(DeliveryIntent,item.intent_id).revision_id)
                     attachment=db.get(Attachment,revision.attachment_id)
-                    if attachment.status=='archived':continue
+                    if event.topic != DISPATCHER_ALERT_TASK and attachment.status=='archived':continue
                     event.published_at=None;reset+=1
             return {'uncertain':expired,'republish':reset}

@@ -102,7 +102,8 @@ def test_quota_response_does_not_exhaust_delivery(session_factory,seed):
     assert deliver_recipient(session_factory,delivery,sink)['state']=='accepted'
     with session_factory() as db:assert db.get(RecipientDelivery,delivery).attempts==5
 
-def test_brevo_tls_verified_sender_and_ack_without_external_network(monkeypatch):
+@pytest.mark.parametrize('content', [b'%PDF synthetic', None])
+def test_brevo_tls_verified_sender_and_ack_without_external_network(monkeypatch, content):
     calls=[]
     class SMTP:
         submission_reply=(250,b'2.0.0 queued synthetic-id')
@@ -111,12 +112,18 @@ def test_brevo_tls_verified_sender_and_ack_without_external_network(monkeypatch)
             assert context.verify_mode==ssl.CERT_REQUIRED and context.check_hostname
         def login(self,user,key):assert user=='smtp-user@example.com' and key=='synthetic-only-smtp-fixture'
         def sendmail(self,sender,recipients,raw):
-            assert sender=='eldis@example.com' and recipients==['dv@example.com'];assert b'Message-ID: <test@example.invalid>' in raw
+            from email import message_from_bytes, policy
+
+            assert sender=='eldis@example.com' and recipients==['dv@example.com']
+            msg = message_from_bytes(raw, policy=policy.default)
+            assert msg['Message-ID'] == '<test@example.invalid>'
+            assert bool(list(msg.iter_attachments())) == (content is not None)
+            assert bool(msg['Disposition-Notification-To']) == (content is not None)
             return {}
         def quit(self):pass
     monkeypatch.setattr('common.smtp_transport.RecordedSMTP',SMTP)
     result=SMTPTransport().send(dict(provider='brevo',recipient='dv@example.com',date='Mon, 02 Nov 2026 09:00:00 +0000',
-        message_id='<test@example.invalid>',payload={},content=b'%PDF synthetic'))
+        message_id='<test@example.invalid>',payload={'body': 'synthetic delivery alert'},content=content))
     assert result['code']==250 and calls==[('smtp-relay.brevo.com',587)]
 
 def test_provider_api_admin_confirmation_stale_and_no_secret_bypass(api):

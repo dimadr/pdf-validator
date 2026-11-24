@@ -13,6 +13,7 @@ from uuid import UUID
 from sqlalchemy import func, or_, select
 from sqlalchemy.dialects.postgresql import insert
 
+from common.brevo_outcomes import DELIVERY_EVENTS, PROBLEM_EVENTS, queue_dispatcher_alerts, snapshot_problem
 from common.models import BrevoDeliveryEvent, BrevoPollCheckpoint, RecipientDelivery, Setting, SMTPAttempt, utcnow
 
 EVENTS_URL = 'https://api.brevo.com/v3/smtp/statistics/events'
@@ -22,9 +23,7 @@ LOOKBACK = timedelta(days=30)
 POLL_LOCK = 703271189042
 BACKOFF_KEY = 'brevo_events_backoff'
 SCAN_KEY = 'brevo_events_scan_v2'
-FINAL_EVENTS = {'delivered': 'delivered', 'hardbounce': 'bounced', 'softbounce': 'bounced',
-                'hardbounces': 'bounced', 'softbounces': 'bounced',
-                'blocked': 'blocked', 'invalid': 'failed', 'error': 'failed', 'failed': 'failed'}
+ALERT_START_KEY = "brevo_delivery_alert_start"
 OPEN_EVENTS = {'opened', 'uniqueopened', 'proxyopen', 'proxyopened'}
 MESSAGE_ID = re.compile(r'[^\s<>@]+@[^\s<>@]+')
 ACK_ID = re.compile(r'\bqueued as\s+(<[^<>\s]+>)', re.IGNORECASE)
@@ -180,7 +179,7 @@ def _store_event(db, raw, target, identities, now):
     when = _event_date(raw.get('date'))
     if not kind or not when or not target.started_at - timedelta(minutes=2) <= when <= now + timedelta(minutes=5):
         processing = 'invalid_event'
-    elif kind in FINAL_EVENTS or kind == 'deferred':
+    elif kind in DELIVERY_EVENTS:
         processing = 'delivery'
     elif kind in OPEN_EVENTS:
         processing = 'open_signal'
@@ -189,10 +188,17 @@ def _store_event(db, raw, target, identities, now):
     key = hashlib.sha256(json.dumps([str(target.attempt_id), raw], sort_keys=True,
                                     separators=(',', ':')).encode()).hexdigest()
     reason = raw.get('reason')
+    reason = reason if isinstance(reason, str) else None
+    payload = raw
+    if processing == 'delivery' and kind in PROBLEM_EVENTS:
+        if db.get(BrevoDeliveryEvent, key) is not None:
+            return processing
+        problem = snapshot_problem(db, target.attempt_id, kind, reason, when, mid)
+        if problem is not None:
+            payload = {**raw, 'delivery_problem': problem}
     db.execute(insert(BrevoDeliveryEvent).values(event_key=key, smtp_attempt_id=target.attempt_id,
         provider_message_id=mid, event_type=kind or 'unknown', occurred_at=when,
-        reason=reason if isinstance(reason, str) else None, processing_state=processing,
-        payload=raw).on_conflict_do_nothing())
+        reason=reason, processing_state=processing, payload=payload).on_conflict_do_nothing())
     return processing
 
 
@@ -211,6 +217,18 @@ def _save_setting(db, key, value):
     serialized = json.dumps(value, default=lambda dt: dt.isoformat())
     db.execute(insert(Setting).values(key=key, value=serialized)
                .on_conflict_do_update(index_elements=[Setting.key], set_={'value': serialized}))
+
+
+def _alert_start(db, now):
+    row = db.scalar(select(Setting.value).where(Setting.key == ALERT_START_KEY))
+    try:
+        start = _event_date(json.loads(row)) if row else None
+    except (TypeError, ValueError):
+        start = None
+    if start is None:
+        start = _event_date(os.getenv('BREVO_DELIVERY_ALERTS_SINCE')) or now
+        _save_setting(db, ALERT_START_KEY, start)
+    return start
 
 
 def _scan(db, now):
@@ -256,6 +274,7 @@ def poll_brevo(factory, client, now=None):
         unique = {target.attempt_id: target for target in targets
                   if any(identities[(target.recipient, mid)] == {target.attempt_id} for mid in target.identifiers)}
         with factory.begin() as db:
+            alert_start = _alert_start(db, now)
             _checkpoints(db, ((target.attempt_id, 'ambiguous_identifier' if target.identifiers else 'missing_identifier')
                               for target in targets if target.attempt_id not in unique), now)
             if not unique:
@@ -301,6 +320,9 @@ def poll_brevo(factory, client, now=None):
                     row = db.scalar(select(Setting).where(Setting.key == SCAN_KEY))
                     if row:
                         db.delete(row)
+                    queued = queue_dispatcher_alerts(db, list(unique), alert_start)
+                    if queued:
+                        report['dispatcher_alerts'] = queued
                     _checkpoints(db, ((attempt_id, None) for attempt_id in unique), now)
                     return report
         report['state'] = 'partial'

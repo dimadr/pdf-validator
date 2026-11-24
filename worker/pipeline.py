@@ -3,7 +3,7 @@ import uuid
 from celery_app import celery_app
 from database import SessionLocal
 from common.config import enabled
-from common.delivery import dispatch_outbox,deliver_recipient,reconcile
+from common.delivery import DISPATCHER_ALERT_TASK, dispatch_outbox, deliver_recipient, reconcile
 from common.pipeline import validate_revision as run_validation,discard_content as run_discard
 from common.smtp_transport import SMTPTransport
 
@@ -21,6 +21,12 @@ def validate_revision(revision_id):
 def send_recipient(delivery_id):
     if not enabled():return {'state':'disabled'}
     return deliver_recipient(SessionLocal,uuid.UUID(delivery_id),SMTPTransport())
+
+@celery_app.task(name=DISPATCHER_ALERT_TASK, acks_late=True, reject_on_worker_lost=True)
+def send_dispatcher_alert(delivery_id):
+    if not enabled():return {'state':'disabled'}
+    return deliver_recipient(SessionLocal, uuid.UUID(delivery_id), SMTPTransport(), dispatcher_alert=True)
+
 
 @celery_app.task(name='pipeline.reconcile')
 def recovery():

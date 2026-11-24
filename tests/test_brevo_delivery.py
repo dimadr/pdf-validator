@@ -116,7 +116,8 @@ def test_exact_provider_identity_per_recipient_and_mdn_independent(session_facto
         assert pipeline_view(db, attachment)['client_delivery']['confirmation'] == {
             'confirmed': 1, 'total': 2, 'brevo_delivered': 1, 'read_confirmed': 1,
         }
-        bounce = delivery_page(db, second['attachment'])['items'][0]['delivery']
+        bounce = next(row['delivery'] for row in delivery_page(db, second['attachment'])['items']
+                      if row['role'] == 'client')
         assert bounce['status'] == 'bounced' and bounce['reason'] == 'Mailbox unavailable'
         assert delivery_page(db, fallback['attachment'])['items'][0]['delivery']['status'] == 'unknown'
 
@@ -294,7 +295,7 @@ def test_case_variant_catches_up_existing_delivery_without_resending(api, tmp_pa
     history = api.request('GET', path + '/deliveries')
     assert history.status_code == 200
     statuses = {row['recipient']: row['delivery']['status'] for row in history.json()['items']}
-    assert statuses == {address: 'delivered', other: 'bounced'}
+    assert statuses == {address: 'delivered', other: 'deferred'}
     integration.poll_brevo(factory, client, now + timedelta(minutes=11))
     with factory() as db:
         assert db.scalar(select(func.count()).select_from(SMTPAttempt)) == 2
@@ -320,3 +321,121 @@ def test_case_variant_collision_with_not_due_attempt_is_ambiguous(session_factor
         assert list(db.scalars(select(BrevoPollCheckpoint.last_error).where(
             BrevoPollCheckpoint.last_error.is_not(None)))) == ['ambiguous_identifier']
         assert db.scalar(select(func.count()).select_from(BrevoDeliveryEvent)) == 0
+
+
+@pytest.mark.parametrize('followup,status,alert_phases', [
+    ('delivered', 'delivered', ['temporary']),
+    ('hardBounces', 'bounced', ['final', 'temporary']),
+])
+def test_dispatcher_alert_transitions_are_per_recipient_and_idempotent(
+        api, tmp_path, mock_api, monkeypatch, followup, status, alert_phases):
+    from common.delivery import DISPATCHER_ALERT_TASK
+    from common.models import DeliveryIntent, OutboxEvent
+
+    factory = sessionmaker(bind=api.engine)
+    dispatcher = 'dispatcher@example.invalid'
+    monkeypatch.setenv('NOTIFY_EMAIL', dispatcher)
+    record = api_seed(api.engine, tmp_path, validated=True)
+    first, other = 'target@example.invalid', 'other@example.invalid'
+    ids = send(factory, record, [first, other])
+    now = utcnow()
+    monkeypatch.setenv('BREVO_DELIVERY_ALERTS_SINCE', (now - timedelta(minutes=1)).isoformat())
+    reason = '450 4.1.8 Sender address rejected: Domain not found'
+    soft = event(ids[first], first, 'softBounces', now, reason=reason)
+    rows = [soft, dict(soft), {**soft, 'tag': 'duplicate metadata'}]
+    client = mock_api(lambda _: httpx.Response(200, json={'events': rows}))
+    initial = integration.poll_brevo(factory, client, now)
+    assert initial['dispatcher_alerts'] == 1
+
+    def alerts(db):
+        return db.execute(select(DeliveryIntent, RecipientDelivery)
+            .join(RecipientDelivery).where(DeliveryIntent.request_key.like('brevo-delivery-alert:%'))).all()
+
+    with factory() as db:
+        [(intent, alert)] = alerts(db)
+        assert intent.kind == 'admin_notification' and alert.role == 'admin' and alert.recipient == dispatcher
+        expected = {'smtp_code': 450, 'smtp_enhanced_code': '4.1.8', 'reason': reason,
+                    'recipient': first, 'calculator_number': db.get(ProcessingRevision, UUID(record['revision'])).calculator_number,
+                    'at': now.isoformat(), 'provider_message_id': integration.canonical_id(provider_id(ids[first])),
+                    'event': 'softbounces'}
+        event_row = db.scalar(select(BrevoDeliveryEvent).where(BrevoDeliveryEvent.event_type == 'softbounces'))
+        assert intent.payload['delivery_problem'] == event_row.payload['delivery_problem']
+        assert all(intent.payload['delivery_problem'][key] == value for key, value in expected.items())
+        assert intent.payload['delivery_problem']['object']
+        assert db.scalar(select(OutboxEvent.topic).where(
+            OutboxEvent.payload['delivery_id'].astext == str(alert.id))) == DISPATCHER_ALERT_TASK
+        alert_id = alert.id
+
+    class DispatcherAck(Ack):
+        def send(self, work):
+            assert work['recipient'] == dispatcher and work['content'] is None
+            assert reason in work['payload']['body']
+            return super().send(work)
+
+    assert deliver_recipient(factory, alert_id, DispatcherAck())['state'] == 'skipped'
+    assert deliver_recipient(factory, ids[other], DispatcherAck(), dispatcher_alert=True)['state'] == 'skipped'
+    assert deliver_recipient(factory, alert_id, DispatcherAck(), dispatcher_alert=True)['state'] == 'accepted'
+
+    next_poll = now + timedelta(minutes=11)
+    rows.extend([
+        event(ids[first], first, followup, now + timedelta(minutes=1), reason='550 5.1.1 Mailbox unavailable')
+        if status == 'bounced' else event(ids[first], first, followup, now + timedelta(minutes=1)),
+        event(alert_id, dispatcher, 'softBounces', now + timedelta(minutes=2), reason=reason),
+    ])
+    integration.poll_brevo(factory, client, next_poll)
+    integration.poll_brevo(factory, client, next_poll + timedelta(minutes=11))
+
+    history = api.request('GET', f"/api/v1/attachments/{record['attachment']}/deliveries")
+    assert history.status_code == 200
+    indexed = {row['recipient']: row for row in history.json()['items'] if row['role'] == 'client'}
+    assert indexed[first]['delivery']['status'] == status
+    assert indexed[first]['delivery']['recovered'] == (status == 'delivered')
+    assert indexed[first]['delivery']['previous_problem'] == (reason if status == 'delivered' else None)
+    assert indexed[other]['delivery']['status'] == 'unknown'
+
+    with factory() as db:
+        assert sorted(intent.request_key.rpartition(':')[2] for intent, _ in alerts(db)) == alert_phases
+        attempts = list(db.scalars(select(SMTPAttempt).join(RecipientDelivery).where(RecipientDelivery.role == 'client')))
+        assert len(attempts) == 2 and all(attempt.attempt == 1 for attempt in attempts)
+
+
+def test_initial_start_boundary_avoids_historical_alerts(session_factory, seed, mock_api, monkeypatch):
+    from common.models import DeliveryIntent
+
+    address = 'target@example.invalid'
+    monkeypatch.delenv('BREVO_DELIVERY_ALERTS_SINCE', raising=False)
+    delivery_id = send(session_factory, seed(), [address])[address]
+    occurred = utcnow()
+    row = event(delivery_id, address, 'softBounces', occurred, reason='451 4.4.0 Temporary failure')
+    client = mock_api(lambda _: httpx.Response(200, json={'events': [row]}))
+    now = occurred + timedelta(minutes=2)
+    assert integration.poll_brevo(session_factory, client, now)['matched'] == 1
+    integration.poll_brevo(session_factory, client, now + timedelta(minutes=11))
+    with session_factory() as db:
+        assert not db.scalar(select(DeliveryIntent.id).where(DeliveryIntent.kind == 'admin_notification'))
+        assert db.scalar(select(BrevoDeliveryEvent.event_type)) == 'softbounces'
+
+
+def test_existing_failure_can_be_alerted_with_scoped_start_without_editing_event(
+        session_factory, seed, mock_api, monkeypatch):
+    from common.models import DeliveryIntent
+
+    address = 'target@example.invalid'
+    delivery_id = send(session_factory, seed(), [address])[address]
+    now = utcnow()
+    reason = '450 4.1.8 Sender address rejected: Domain not found'
+    with session_factory.begin() as db:
+        attempt_id = db.scalar(select(SMTPAttempt.id).where(SMTPAttempt.delivery_id == delivery_id))
+        db.add(BrevoDeliveryEvent(event_key='c' * 64, smtp_attempt_id=attempt_id,
+                                provider_message_id=integration.canonical_id(provider_id(delivery_id)),
+                                event_type='softbounces', occurred_at=now,
+                                reason=reason, processing_state='delivery', payload={}))
+    monkeypatch.setenv('BREVO_DELIVERY_ALERTS_SINCE', now.isoformat())
+    client = mock_api(lambda _: httpx.Response(200, json={'events': []}))
+    result = integration.poll_brevo(session_factory, client, now + timedelta(minutes=10))
+    assert result['dispatcher_alerts'] == 1
+    with session_factory() as db:
+        assert db.get(BrevoDeliveryEvent, 'c' * 64).payload == {}
+        intent = db.scalar(select(DeliveryIntent).where(DeliveryIntent.kind == 'admin_notification'))
+        assert intent.payload['delivery_problem']['smtp_code'] == 450
+        assert intent.payload['delivery_problem']['recipient'] == address
